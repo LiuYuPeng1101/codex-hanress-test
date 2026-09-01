@@ -8,9 +8,21 @@ spring:
         name: order-mcp-server
         version: 1.0.0
         type: SYNC
-
         streamable-http:
           mcp-endpoint: /mcp
+
+codex:
+  runtime:
+    # Local development: resolves from PATH.
+    # Docker/Linux production: set CODEX_EXECUTABLE=/usr/local/bin/codex if needed.
+    executable: ${CODEX_EXECUTABLE:codex}
+    startup-timeout: 30s
+
 agent:
-  order:
-    workspace: D:/daima/codex-agent/hanress-test
+  definitions:
+    order:
+      # Use an environment variable in deployments; "." keeps local development portable.
+      # Codex discovers project-scoped skills from <workspace>/.agents/skills.
+      workspace: ${AGENT_ORDER_WORKSPACE:.}
+      required-skills:
+        - order-analysis
