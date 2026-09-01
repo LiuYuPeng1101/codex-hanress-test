@@ -1,0 +1,13 @@
+spring:
+  application:
+    name: hanress-test
+  ai:
+    mcp:
+      server:
+        protocol: STREAMABLE
+        name: order-mcp-server
+        version: 1.0.0
+        type: SYNC
+
+        streamable-http:
+          mcp-endpoint: /mcp
