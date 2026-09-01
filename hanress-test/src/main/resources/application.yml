@@ -19,6 +19,10 @@ codex:
     startup-timeout: 30s
 
 agent:
+  approval:
+    # 学习阶段用于模拟人工审批：accept / decline / cancel。
+    # 安全起见默认 decline。生产环境应替换为数据库 + 前端审批中心，而不是自动同意。
+    default-decision: ${AGENT_APPROVAL_DEFAULT_DECISION:decline}
   definitions:
     order:
       # 部署环境建议通过环境变量注入；本地开发使用 "." 可以保持项目路径可移植。

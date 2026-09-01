@@ -1,0 +1,13 @@
+# Codex MCP 配置示例。
+# 实际运行时请把对应配置放到 Codex 使用的 config.toml 中。
+
+[mcp_servers.order]
+url = "http://127.0.0.1:8080/mcp"
+
+# 查询类 Tool 自动批准。
+[mcp_servers.order.tools.get_order_status]
+approval_mode = "approve"
+
+# 写操作 Tool 每次调用前都要求审批。
+[mcp_servers.order.tools.cancel_order]
+approval_mode = "prompt"
