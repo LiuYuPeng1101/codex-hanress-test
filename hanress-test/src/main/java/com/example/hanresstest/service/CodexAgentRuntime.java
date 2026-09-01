@@ -19,10 +19,11 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Agent-facing Codex runtime adapter.
+ * 面向业务 Agent 的 Codex Runtime 适配层。
  *
- * <p>Business code talks to this service by agentId. It translates an Agent definition into
- * Codex thread/turn calls while the low-level client remains completely agent-neutral.</p>
+ * <p>业务层只需要通过 agentId 调用本类，不需要了解 App Server 的 JSON-RPC 协议细节。
+ * 本类负责把 Agent 定义转换成 Codex 的 Thread / Turn 调用，同时保证底层
+ * {@link CodexAppServerClient} 与具体的订单、财务、合同等业务 Agent 解耦。</p>
  */
 @Service
 public class CodexAgentRuntime implements ApplicationRunner {
@@ -39,8 +40,10 @@ public class CodexAgentRuntime implements ApplicationRunner {
     }
 
     /**
-     * Production startup flow: start App Server once, then validate every configured Agent's
-     * required skills. skills/list is a readiness check; it is not how skills are registered.
+     * 应用启动流程：只启动一次 Codex App Server，然后校验所有已配置 Agent 的必需 Skill。
+     *
+     * <p>这里调用 skills/list 的目的只是做启动期健康检查和快速失败，
+     * 不是用来“注册” Skill。Skill 的真正发现由 Codex Harness 根据 Agent workspace 自动完成。</p>
      */
     @Override
     public void run(ApplicationArguments args) throws Exception {
@@ -51,21 +54,32 @@ public class CodexAgentRuntime implements ApplicationRunner {
         }
     }
 
+    /**
+     * 为指定 Agent 创建一段新的 Codex 会话。
+     *
+     * <p>这里会先根据 agentId 找到 Agent 定义，再把 Agent 的 workspace 转换成
+     * thread/start 的 cwd 参数。Codex 会基于这个 cwd 发现项目级 Skill。</p>
+     */
     public CompletableFuture<String> startConversation(String agentId) {
         AgentCatalogProperties.AgentDefinition definition = catalog.require(agentId);
         return client.startThread(resolveWorkspace(definition).toString());
     }
 
     /**
-     * No skill is forced into the turn. Codex sees skills discovered from the thread cwd and
-     * may select one based on its name/description and the user's request.
+     * 自动 Skill 选择模式。
+     *
+     * <p>这一轮不会强制指定某个 Skill。Codex 会根据当前 Thread 已发现的 Skill 元数据
+     * 以及用户输入，自主判断是否需要使用某个 Skill。</p>
      */
     public CompletableFuture<String> startTurnAuto(String threadId, String message) {
         return client.startTurn(threadId, message);
     }
 
     /**
-     * Deterministic mode for a business action that already knows the desired skill.
+     * 显式 Skill 模式。
+     *
+     * <p>适用于业务系统已经明确知道应该使用哪个 Skill 的确定性场景，例如用户点击
+     * “订单异常分析”按钮。此时无需再让模型猜测应该选择哪个 Skill。</p>
      */
     public CompletableFuture<String> startTurnWithSkill(
             String agentId,
@@ -84,26 +98,33 @@ public class CodexAgentRuntime implements ApplicationRunner {
 
         Path skillsRoot = workspace.resolve(".agents").resolve("skills").normalize();
         if (!skillFile.startsWith(skillsRoot)) {
-            throw new IllegalArgumentException("Invalid skill name: " + skillName);
+            throw new IllegalArgumentException("非法的 Skill 名称: " + skillName);
         }
         if (!Files.isRegularFile(skillFile)) {
-            throw new IllegalStateException("Skill file does not exist: " + skillFile);
+            throw new IllegalStateException("Skill 文件不存在: " + skillFile);
         }
 
         return client.startTurnWithSkill(threadId, message, skillName, skillFile.toString());
     }
 
+    /**
+     * 手动重新校验某个 Agent 的必需 Skill，主要用于健康检查、运维或 Skill 变更后的重新验证。
+     */
     public Set<String> validateRequiredSkills(String agentId) throws Exception {
         return validateRequiredSkills(agentId, catalog.require(agentId));
     }
 
+    /**
+     * 查询 Codex 当前从指定 workspace 发现的 Skill，并与 Agent 配置中的 required-skills 对比。
+     * 如果缺少必需 Skill，则直接抛出异常，避免服务处于“能启动但不能正确工作”的半可用状态。
+     */
     private Set<String> validateRequiredSkills(
             String agentId,
             AgentCatalogProperties.AgentDefinition definition
     ) throws Exception {
         Path workspace = resolveWorkspace(definition);
         if (!Files.isDirectory(workspace)) {
-            throw new IllegalStateException("Agent workspace does not exist: " + workspace);
+            throw new IllegalStateException("Agent workspace 不存在: " + workspace);
         }
 
         JsonNode response = client
@@ -126,18 +147,21 @@ public class CodexAgentRuntime implements ApplicationRunner {
         missing.removeAll(discovered);
         if (!missing.isEmpty()) {
             throw new IllegalStateException(
-                    "Agent '" + agentId + "' is not ready. Codex did not discover required skills "
-                            + missing + " from workspace " + workspace
+                    "Agent '" + agentId + "' 未就绪。Codex 未能从 workspace " + workspace
+                            + " 发现必需 Skill: " + missing
             );
         }
 
-        log.info("Agent '{}' ready. Codex discovered skills: {}", agentId, discovered);
+        log.info("Agent '{}' 已就绪，Codex 已发现 Skills: {}", agentId, discovered);
         return Set.copyOf(discovered);
     }
 
+    /**
+     * 把 Agent 配置中的 workspace 解析成绝对路径，确保本地、Docker、Linux 等环境使用同一套代码。
+     */
     private Path resolveWorkspace(AgentCatalogProperties.AgentDefinition definition) {
         if (definition.workspace() == null || definition.workspace().isBlank()) {
-            throw new IllegalStateException("Agent workspace must be configured");
+            throw new IllegalStateException("必须配置 Agent workspace");
         }
         return Path.of(definition.workspace()).toAbsolutePath().normalize();
     }
