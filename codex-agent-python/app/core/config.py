@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
     agent_workspace: Path = Path(".")
 
+    # Java 业务系统暴露的 MCP Server 地址。
+    # 本地同机运行时默认连接 127.0.0.1:8080；Docker 或跨主机部署时通过环境变量覆盖。
+    order_mcp_url: str = "http://127.0.0.1:8080/mcp"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
