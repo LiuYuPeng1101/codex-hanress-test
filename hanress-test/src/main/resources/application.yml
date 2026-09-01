@@ -13,16 +13,16 @@ spring:
 
 codex:
   runtime:
-    # Local development: resolves from PATH.
-    # Docker/Linux production: set CODEX_EXECUTABLE=/usr/local/bin/codex if needed.
+    # 本地开发：默认从系统 PATH 中查找 codex 可执行文件。
+    # Docker / Linux 生产环境：如有需要，可设置 CODEX_EXECUTABLE=/usr/local/bin/codex。
     executable: ${CODEX_EXECUTABLE:codex}
     startup-timeout: 30s
 
 agent:
   definitions:
     order:
-      # Use an environment variable in deployments; "." keeps local development portable.
-      # Codex discovers project-scoped skills from <workspace>/.agents/skills.
+      # 部署环境建议通过环境变量注入；本地开发使用 "." 可以保持项目路径可移植。
+      # Codex 会从 <workspace>/.agents/skills 中发现当前 Agent 的项目级 Skill。
       workspace: ${AGENT_ORDER_WORKSPACE:.}
       required-skills:
         - order-analysis
