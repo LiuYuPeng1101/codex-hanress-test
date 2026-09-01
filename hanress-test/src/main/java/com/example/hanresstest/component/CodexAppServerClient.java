@@ -23,32 +23,76 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Codex App Server 的底层传输客户端。
+ * Codex App Server 的底层客户端。
  *
- * <p>这个类只负责 App Server 进程生命周期、stdin/stdout JSON-RPC 通信、请求响应关联和事件接收。
- * 它刻意不理解订单、财务、合同等具体业务 Agent。Agent 的 workspace、skills、policy 等信息
- * 应该放在更上层的 Runtime / Service 层。</p>
+ * <p>这个类只负责“如何和 codex app-server 通信”，不负责具体业务 Agent 的定义。</p>
+ *
+ * <p>它主要承担以下职责：</p>
+ * <ul>
+ *     <li>启动和关闭 {@code codex app-server} 子进程</li>
+ *     <li>通过 stdin/stdout 与 App Server 进行 JSON-RPC 通信</li>
+ *     <li>维护请求 ID 与异步响应之间的对应关系</li>
+ *     <li>创建 Thread（Agent 会话）</li>
+ *     <li>启动 Turn（一次完整的 Agent 执行）</li>
+ *     <li>查询 Codex 当前能发现的 Skills</li>
+ *     <li>接收 App Server 推送的事件</li>
+ *     <li>接收 App Server 主动发给宿主应用的 Server Request，例如未来的 Approval</li>
+ * </ul>
+ *
+ * <p>注意：这个类不应该知道 order-agent、finance-agent、contract-agent 等业务概念。
+ * Agent 的 workspace、skills、模型、策略等信息应该由更上层的 Runtime/Agent Definition 管理。</p>
  */
 @Component
 public class CodexAppServerClient {
 
     private static final Logger log = LoggerFactory.getLogger(CodexAppServerClient.class);
 
+    /** JSON 序列化/反序列化工具，用于构造和解析 App Server 的 JSON-RPC 消息。 */
     private final ObjectMapper mapper = new ObjectMapper();
+
+    /** Codex Runtime 配置，例如 codex 可执行文件路径、启动超时时间。 */
     private final CodexRuntimeProperties properties;
+
+    /**
+     * JSON-RPC 请求 ID 生成器。
+     * 每个 request 都必须有唯一 ID，App Server 返回 response 时会携带同一个 ID。
+     */
     private final AtomicLong requestId = new AtomicLong(1);
+
+    /**
+     * 保存“requestId -> 等待该响应的 CompletableFuture”。
+     * App Server 的响应顺序不一定和请求发送顺序一致，所以通过 requestId 做请求/响应关联。
+     */
     private final Map<Long, CompletableFuture<JsonNode>> pendingRequests = new ConcurrentHashMap<>();
+
+    /** stdin 写锁，避免多个线程同时发送 JSON 时把消息写串。 */
     private final Object writeLock = new Object();
 
+    /** App Server 子进程。 */
     private Process process;
+
+    /** 向 App Server stdin 写入 JSON-RPC 消息。 */
     private BufferedWriter writer;
+
+    /** 标记当前 Client 是否正在运行。 */
     private volatile boolean running;
 
     public CodexAppServerClient(CodexRuntimeProperties properties) {
         this.properties = properties;
     }
 
-    /** 启动 codex app-server 子进程，并完成协议初始化。 */
+    /**
+     * 启动 Codex App Server，并完成协议初始化。
+     *
+     * <p>执行顺序：</p>
+     * <ol>
+     *     <li>启动 {@code codex app-server} 子进程</li>
+     *     <li>创建 stdin writer</li>
+     *     <li>启动 stdout Reader Loop</li>
+     *     <li>启动 stderr 日志读取线程</li>
+     *     <li>发送 initialize / initialized 完成握手</li>
+     * </ol>
+     */
     public synchronized void start() throws Exception {
         if (running) {
             return;
@@ -63,7 +107,10 @@ public class CodexAppServerClient {
         initialize(properties.startupTimeout());
     }
 
-    /** 根据当前操作系统构建 codex app-server 启动命令。 */
+    /**
+     * 根据当前操作系统构建 App Server 启动命令。
+     * Windows 使用 cmd.exe；Linux / Docker 直接执行 codex 二进制。
+     */
     private ProcessBuilder createProcessBuilder() {
         String executable = properties.executable();
         boolean windows = System.getProperty("os.name", "").toLowerCase().contains("win");
@@ -74,7 +121,10 @@ public class CodexAppServerClient {
         return new ProcessBuilder(executable, "app-server");
     }
 
-    /** 完成 App Server initialize / initialized 握手。 */
+    /**
+     * 完成 App Server 的 initialize / initialized 握手。
+     * 一条连接只有初始化成功后，后续才能调用 thread/start、turn/start、skills/list 等方法。
+     */
     private void initialize(Duration timeout) throws Exception {
         ObjectNode clientInfo = mapper.createObjectNode();
         clientInfo.put("name", "spring-boot-agent-runtime");
@@ -91,7 +141,14 @@ public class CodexAppServerClient {
 
     /**
      * 创建一个新的 Codex Thread。
-     * workspace 会被写入 thread/start.cwd，Codex 会基于这个工作目录发现项目级 Skill。
+     *
+     * <p>Thread 可以理解成“一个持续存在的 Agent 聊天窗口 / Agent 会话”。
+     * 同一个 Thread 中可以连续运行多个 Turn，并共享这个 Thread 的上下文。</p>
+     *
+     * @param workspace Agent 的工作目录，同时作为 thread/start 的 cwd。
+     *                  Codex 会基于这个目录发现项目级 Skill，例如：
+     *                  {@code <workspace>/.agents/skills}
+     * @return 新创建的 threadId
      */
     public CompletableFuture<String> startThread(String workspace) {
         ObjectNode params = mapper.createObjectNode();
@@ -102,8 +159,10 @@ public class CodexAppServerClient {
     }
 
     /**
-     * 查询指定 workspace 下 Codex 当前能够发现的 Skill。
-     * 该接口主要用于启动健康检查、运维展示和问题排查，不是每轮 Turn 的 Skill 注册步骤。
+     * 查询指定 workspace 下 Codex 当前能够发现的 Skills。
+     *
+     * <p>这个方法主要用于启动健康检查、Agent Console 展示和问题排查。
+     * 它不是 Skill 注册接口，也不需要每个 Turn 都调用。</p>
      */
     public CompletableFuture<JsonNode> listSkills(String workspace, boolean forceReload) {
         ObjectNode params = mapper.createObjectNode();
@@ -113,15 +172,21 @@ public class CodexAppServerClient {
     }
 
     /**
-     * 启动一个普通 Turn，不显式指定 Skill，由 Codex 根据已发现的 Skill 和用户输入自动选择。
+     * 启动一次普通 Turn。
+     *
+     * <p>Turn 可以理解成“聊天窗口中的一轮完整执行”：用户输入一次消息，
+     * Codex Harness 可能经历模型推理、Skill 选择、MCP / Tool 调用等步骤，直到本轮完成。</p>
+     *
+     * <p>这里不显式指定 Skill，因此 Codex 可以根据当前 Thread 已发现的 Skill metadata
+     * 和用户请求自动决定是否使用某个 Skill。</p>
      */
     public CompletableFuture<String> startTurn(String threadId, String message) {
         return startTurnInternal(threadId, message, null, null);
     }
 
     /**
-     * 启动一个显式指定 Skill 的 Turn。
-     * 适合确定性业务流程，例如业务系统已经知道当前操作就是“订单异常分析”。
+     * 启动一次显式指定 Skill 的 Turn。
+     * 适合业务系统已经明确知道应该使用哪个 Skill 的场景。
      */
     public CompletableFuture<String> startTurnWithSkill(
             String threadId,
@@ -132,7 +197,10 @@ public class CodexAppServerClient {
         return startTurnInternal(threadId, message, skillName, skillPath);
     }
 
-    /** 统一构造 turn/start 请求。 */
+    /**
+     * 统一构造 turn/start 请求。
+     * 普通模式只加入 text input；显式 Skill 模式会额外加入 skill input item。
+     */
     private CompletableFuture<String> startTurnInternal(
             String threadId,
             String message,
@@ -159,7 +227,10 @@ public class CodexAppServerClient {
     }
 
     /**
-     * 发送带 request id 的 JSON-RPC 请求，并通过 CompletableFuture 等待对应响应。
+     * 发送一条需要响应的 JSON-RPC Request。
+     *
+     * <p>方法会生成唯一 requestId，并创建 CompletableFuture 放入 pendingRequests。
+     * 真正响应由 stdout Reader Loop 异步读取，再通过相同 ID 完成对应 Future。</p>
      */
     private CompletableFuture<JsonNode> request(String method, JsonNode params) {
         ensureRunning();
@@ -182,7 +253,10 @@ public class CodexAppServerClient {
         return future;
     }
 
-    /** 发送没有 request id 的 JSON-RPC Notification。 */
+    /**
+     * 发送 JSON-RPC Notification。
+     * Notification 没有 requestId，因此不会等待 Response。
+     */
     private void notify(String method, JsonNode params) throws Exception {
         ensureRunning();
         ObjectNode message = mapper.createObjectNode();
@@ -192,8 +266,8 @@ public class CodexAppServerClient {
     }
 
     /**
-     * 向 App Server stdin 写一行 JSONL。
-     * writeLock 保证多个调用线程不会把 JSON 写串。
+     * 将一条 JSON 消息写入 App Server stdin。
+     * stdio transport 使用一行一条 JSON 消息，所以每次写完都需要换行并 flush。
      */
     private void write(JsonNode message) throws Exception {
         synchronized (writeLock) {
@@ -205,7 +279,9 @@ public class CodexAppServerClient {
 
     /**
      * 启动唯一的 stdout Reader Loop。
-     * 所有 response、notification、server request 都由这个线程统一读取后再分发。
+     *
+     * <p>不能让多个业务线程分别 readLine()，否则 Response、Notification、Server Request 会互相抢消息。
+     * 所有 stdout 消息统一由这个线程读取，再交给 dispatch() 分类处理。</p>
      */
     private void startStdoutReader() {
         Thread readerThread = new Thread(() -> {
@@ -221,7 +297,7 @@ public class CodexAppServerClient {
             } catch (Exception e) {
                 if (running) {
                     failAll(e);
-                    log.error("Codex App Server 读取线程异常", e);
+                    log.error("Codex App Server Reader Loop 异常", e);
                 }
             }
         }, "codex-app-server-reader");
@@ -230,10 +306,13 @@ public class CodexAppServerClient {
     }
 
     /**
-     * 根据 JSON-RPC 消息形态做统一分发：
-     * 1. 有 id、无 method：客户端请求的响应；
-     * 2. 有 id、有 method：App Server 主动发给客户端的 Server Request；
-     * 3. 有 method、无 id：普通 Notification/Event。
+     * 对 App Server stdout 中的消息进行分类路由。
+     *
+     * <ul>
+     *     <li>有 id、无 method：我们之前发送的 Request 对应的 Response</li>
+     *     <li>有 id、有 method：App Server 主动发给 Java 的 Server Request，例如 Approval</li>
+     *     <li>有 method、无 id：Notification / Event，例如 turn/completed、item/agentMessage/delta</li>
+     * </ul>
      */
     private void dispatch(JsonNode message) throws Exception {
         if (message.has("id") && !message.has("method")) {
@@ -251,7 +330,9 @@ public class CodexAppServerClient {
         }
     }
 
-    /** 根据 request id 找到等待中的 CompletableFuture 并完成它。 */
+    /**
+     * 处理普通 JSON-RPC Response，并通过 requestId 找到对应的 CompletableFuture。
+     */
     private void handleResponse(JsonNode message) {
         long id = message.path("id").asLong();
         CompletableFuture<JsonNode> future = pendingRequests.remove(id);
@@ -268,9 +349,12 @@ public class CodexAppServerClient {
     }
 
     /**
-     * 处理 App Server -> Java 的反向请求。
-     * 后续学习 Approval 时会在这里接入真正的审批路由。
-     * 当前对未知 Server Request 立即返回错误，避免 Turn 因一直等不到响应而永久挂起。
+     * 处理 App Server 主动发给 Java 宿主应用的 Server Request。
+     *
+     * <p>未来学习 Approval / Human-in-the-loop 时，这里会成为关键入口。</p>
+     *
+     * <p>当前 Demo 还没有实现 Approval，因此对未知 Server Request 立即返回 Method Not Found，
+     * 避免 App Server 一直等待响应导致当前 Turn 永久挂起。</p>
      */
     private void handleServerRequest(JsonNode request) throws Exception {
         ObjectNode response = mapper.createObjectNode();
@@ -283,8 +367,16 @@ public class CodexAppServerClient {
     }
 
     /**
-     * 处理 App Server 推送的事件。
-     * 当前示例只展示 Agent 文本增量、Turn 完成和 Skill 变化事件；后续会扩展为统一 AgentEvent。
+     * 处理 App Server 推送的 Notification / Event。
+     *
+     * <p>当前 Demo 只处理少量事件：</p>
+     * <ul>
+     *     <li>item/agentMessage/delta：Agent 最终回答的流式文本</li>
+     *     <li>turn/completed：当前 Turn 已完成</li>
+     *     <li>skills/changed：本地 Skill 发生变化</li>
+     * </ul>
+     *
+     * <p>以后做 Agent Gateway 时，这里应该进一步抽象成统一 AgentEvent，并通过 SSE / WebSocket 推给前端。</p>
      */
     private void handleNotification(JsonNode event) {
         String method = event.path("method").asText();
@@ -306,7 +398,8 @@ public class CodexAppServerClient {
     }
 
     /**
-     * 单独消费 stderr，避免日志污染 stdout 的 JSON-RPC 数据，也防止 stderr 缓冲区写满导致子进程阻塞。
+     * 单独消费 App Server stderr。
+     * stdout 是 JSON-RPC 协议流，stderr 是日志流，二者不能合并。
      */
     private void startStderrReader() {
         Thread stderrThread = new Thread(() -> {
@@ -333,13 +426,16 @@ public class CodexAppServerClient {
         }
     }
 
-    /** 当 App Server 异常退出时，让所有等待中的请求立即失败。 */
+    /** App Server 异常退出或 Client 关闭时，让所有等待中的请求立即失败。 */
     private void failAll(Throwable error) {
         pendingRequests.forEach((id, future) -> future.completeExceptionally(error));
         pendingRequests.clear();
     }
 
-    /** Spring 容器关闭时同步结束 App Server 子进程并释放等待中的请求。 */
+    /**
+     * Spring Bean 销毁时关闭 App Server 子进程。
+     * 先尝试正常结束；5 秒内未退出则强制结束。
+     */
     @PreDestroy
     public synchronized void close() {
         running = false;
