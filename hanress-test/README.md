@@ -1,42 +1,232 @@
 # Codex Harness + Spring Boot Demo
 
-这个模块用于学习如何把现有 Java / Spring Boot 业务能力接入 Codex Harness。
+这个模块用于学习如何把现有 Java / Spring Boot 业务能力接入 Codex Harness，并把学习阶段的 Demo 写法逐步重构成可用于正式项目的结构。
 
 当前示例包含：
 
 - Codex App Server：Spring Boot 通过 JSON-RPC 控制 Codex Runtime
 - MCP Server：Spring AI Streamable HTTP MCP
 - Tool：`get_order_status`
-- Resource：订单状态说明
-- Prompt：MCP Prompt 示例
+- Resource：`order://status/guide`
+- Prompt：`order_analysis`
 - Skill：`.agents/skills/order-analysis/SKILL.md`
 
-## 1. 生产级职责边界
+---
 
-不要为每一个 Agent 复制一份 `CodexAppServerClient`。
-
-推荐分层：
+# 1. 当前项目目录结构
 
 ```text
-Business / Agent Gateway
-        |
-        v
-CodexAgentRuntime             <-- 按 agentId 管 workspace / skill
-        |
-        v
-CodexAppServerClient          <-- 只负责 App Server 进程和 JSON-RPC
-        |
-        v
-codex app-server
-        |
-        v
-Codex Harness
+hanress-test/
+├── .agents/
+│   └── skills/
+│       └── order-analysis/
+│           ├── SKILL.md
+│           └── references/
+│               └── status-rules.md
+│
+├── src/main/java/com/example/hanresstest/
+│   ├── HanressTestApplication.java
+│   │
+│   ├── component/
+│   │   ├── CodexAppServerClient.java
+│   │   ├── OrderPrompts.java
+│   │   └── OrderResources.java
+│   │
+│   ├── config/
+│   │   ├── AgentCatalogProperties.java
+│   │   ├── CodexRuntimeProperties.java
+│   │   └── McpToolConfig.java
+│   │
+│   └── service/
+│       ├── CodexAgentRuntime.java
+│       └── OrderService.java
+│
+├── src/main/resources/
+│   └── application.yml
+│
+├── pom.xml
+├── .gitignore
+└── README.md
 ```
 
-`CodexAppServerClient` 不应该知道 `order-agent`、`finance-agent`、`contract-agent` 等业务概念。
-不同 Agent 的 workspace、必需 Skill 等信息放到 Agent Definition 配置中。
+`target/`、`.idea/` 等生成物不应该提交到 Git，已经通过 `.gitignore` 排除。
 
-当前示例配置：
+---
+
+# 2. 项目架构
+
+```text
+业务系统 / 未来的 Agent Gateway
+              |
+              v
+       CodexAgentRuntime
+       - 根据 agentId 找 Agent Definition
+       - 决定 workspace
+       - 创建 Conversation / Turn
+       - 校验 required skills
+              |
+              v
+     CodexAppServerClient
+       - 启动 codex app-server
+       - initialize
+       - JSON-RPC request/response
+       - thread/start
+       - turn/start
+       - skills/list
+       - event / server request
+              |
+              v
+        codex app-server
+              |
+              v
+         Codex Harness
+          /         \
+         /           \
+      Skills          MCP
+                        |
+                        v
+             Spring Boot MCP Server
+                /       |       \
+               /        |        \
+            Tool     Resource   Prompt
+              |
+              v
+         OrderService
+```
+
+最重要的职责边界：
+
+```text
+CodexAppServerClient
+= Codex Runtime 通信基础设施
+= 不应该知道 order / finance / contract 等业务概念
+
+CodexAgentRuntime
+= Agent Runtime Adapter
+= 根据 agentId 决定 workspace、required skills 等 Agent 配置
+
+Skill
+= Agent 完成专业任务的方法/SOP
+
+MCP Tool
+= Agent 可以调用的真实业务能力
+```
+
+以后新增 Finance Agent、Contract Agent 时，不复制 `CodexAppServerClient`。
+
+---
+
+# 3. cwd 到底是什么？
+
+`cwd` 是 **current working directory，当前工作目录**。
+
+它不是 Skill 的路径，也不是 `SKILL.md` 的路径。
+
+它表示：
+
+> “这个 Codex Thread 当前在哪个 Agent 工作空间里运行？”
+
+例如本地项目：
+
+```text
+D:/daima/codex-agent/hanress-test
+```
+
+这个目录就是 order Agent 的 workspace。
+
+创建 Thread 时 Java 最终发送：
+
+```json
+{
+  "method": "thread/start",
+  "params": {
+    "cwd": "D:/daima/codex-agent/hanress-test"
+  }
+}
+```
+
+然后 Codex 以这个目录作为当前项目上下文。
+
+因此可以理解为：
+
+```text
+cwd
+ |
+ v
+Agent Workspace
+ |
+ +-- .agents/skills
+ +-- 项目文件
+ +-- 其他 Codex 可以在当前上下文感知的内容
+```
+
+---
+
+# 4. Skill 到底是怎么让 Codex 知道的？
+
+不是 Java 调用 `registerSkill()`。
+
+生产级思路是：
+
+```text
+1. Skill 跟 Agent 一起部署到 workspace
+
+2. 创建 Codex Thread 时传 cwd = workspace
+
+3. Codex Harness 根据 workspace 发现 .agents/skills 下的 Skill
+
+4. skills/list 只负责校验是否发现成功
+```
+
+例如：
+
+```text
+/app
+└── .agents
+    └── skills
+        └── order-analysis
+            └── SKILL.md
+```
+
+Thread：
+
+```json
+{
+  "method": "thread/start",
+  "params": {
+    "cwd": "/app"
+  }
+}
+```
+
+于是关系就是：
+
+```text
+cwd = /app
+   |
+   v
+/app/.agents/skills
+   |
+   v
+order-analysis/SKILL.md
+   |
+   v
+Codex Harness 发现 order-analysis
+```
+
+所以你的理解是对的：
+
+> Docker 部署时，把 `.agents/skills` 一起打进 Agent Service 镜像，然后把容器中的 Agent workspace（例如 `/app`）作为 `cwd` 传给 Codex，Codex 就能从这个 workspace 发现 Skills。
+
+不过要注意：**Skill 发现不是 Docker 专属机制。** 本地 Windows、Linux、Docker 都一样，核心都是：
+
+```text
+正确的 workspace + 正确的 cwd + .agents/skills
+```
+
+---
+
+# 5. 本项目如何配置 workspace
 
 ```yaml
 codex:
@@ -52,89 +242,48 @@ agent:
         - order-analysis
 ```
 
-本地开发可使用 `.`；Docker / Linux 中推荐显式设置：
+本地开发：
+
+```text
+AGENT_ORDER_WORKSPACE=.
+```
+
+表示 Spring Boot 的工作目录就是 Agent workspace。
+
+Docker / Linux 正式环境推荐：
 
 ```bash
 AGENT_ORDER_WORKSPACE=/app
 CODEX_EXECUTABLE=/usr/local/bin/codex
 ```
 
----
-
-# 2. 如何让 Codex 发现 Skill
-
-## 2.1 目录约定
-
-项目级 Skill 放在 Agent workspace 下的 `.agents/skills`：
+Java 源码不应该写死：
 
 ```text
-<workspace>/
-└── .agents/
-    └── skills/
-        └── order-analysis/
-            ├── SKILL.md
-            └── references/
-                └── status-rules.md
+D:/daima/...
 ```
-
-本项目：
-
-```text
-hanress-test/
-└── .agents/skills/order-analysis/SKILL.md
-```
-
-## 2.2 `thread/start.cwd` 是发现 Skill 的关键
-
-创建 Codex Thread 时必须把该 Agent 的 workspace 传给 App Server：
-
-```json
-{
-  "method": "thread/start",
-  "params": {
-    "cwd": "/app"
-  }
-}
-```
-
-Codex 会以该 `cwd` 为项目上下文发现可用的项目级 Skills。
-
-在本项目中，业务代码不直接调用 `CodexAppServerClient.startThread()` 拼业务参数，而是：
-
-```java
-String threadId = codexAgentRuntime
-        .startConversation("order")
-        .get();
-```
-
-`CodexAgentRuntime` 从 `AgentCatalogProperties` 读取 order Agent 的 workspace，再转换成 `thread/start`。
-
-## 2.3 不需要 `registerSkill()`
-
-正常运行时不要：
-
-- 手工读取 `SKILL.md` 再拼进 system prompt
-- 每个 Turn 都调用 `skills/list`
-- 在 `CodexAppServerClient` 中硬编码 Windows 绝对路径
-- 给每个 Agent 复制一个 App Server Client
-
-Skill Discovery 是 Codex Harness 的职责。
 
 ---
 
-# 3. `skills/list` 的正确用途
+# 6. `skills/list` 为什么还存在？
 
-`skills/list` 不是注册 Skill 的步骤，它应该主要用于：
+`skills/list` 不是注册 Skill。
 
-- Agent Service 启动健康检查
-- Agent Console 展示当前可用 Skill
-- Skill 文件变化后的重新校验
-- 排查 Skill 为什么没有被发现
+它用于：
 
-本项目在 Spring Boot 启动时：
+- 启动健康检查
+- readiness / fail-fast
+- Agent Console 展示可用 Skills
+- Skill 变更后的重新检查
+- 排查 Skill Discovery 问题
+
+本项目启动流程：
 
 ```text
-start App Server
+Spring Boot start
+      |
+      v
+start codex app-server
       |
       v
 initialize
@@ -145,38 +294,28 @@ skills/list(workspace, forceReload=true)
       v
 检查 required-skills
       |
-      v
-Agent Ready / 启动失败
+      +-- order-analysis 存在 --> Agent Ready
+      |
+      +-- 不存在 --> 启动失败
 ```
 
-`CodexAgentRuntime` 会检查：
-
-```yaml
-required-skills:
-  - order-analysis
-```
-
-如果 Codex 没有发现 `order-analysis`，应用会直接启动失败，而不是等真实用户请求进来后才发现 Agent 配置错误。
-
-这是 readiness / fail-fast 机制，不是每轮 Turn 的业务流程。
+这样生产环境不会等真实用户请求进来后才发现 Skill 配置错误。
 
 ---
 
-# 4. Codex 如何自动使用 Skill
+# 7. Codex 如何自动使用 Skill？
 
-发现 Skill 和使用 Skill 是两件事。
+“发现 Skill”和“使用 Skill”是两件事。
 
 ```text
 Discovery
-Codex 知道有哪些 Skills
+= Codex 知道 order-analysis 存在
 
 Selection
-当前 Turn 是否应该使用某个 Skill
+= 当前用户请求是否应该使用 order-analysis
 ```
 
-## 4.1 自动选择模式
-
-普通对话直接发送文本：
+自动模式：
 
 ```java
 codexAgentRuntime.startTurnAuto(
@@ -186,9 +325,10 @@ codexAgentRuntime.startTurnAuto(
 ```
 
 此时没有强制指定 Skill。
-Codex 会根据已发现 Skill 的元数据和当前请求判断是否应该使用它。
 
-因此 `SKILL.md` 顶部的 front matter 非常重要：
+Codex 根据已发现 Skill 的 `name`、`description` 和用户请求判断是否使用。
+
+因此 `SKILL.md` front matter 很重要：
 
 ```yaml
 ---
@@ -197,28 +337,26 @@ description: Analyze order status, delivery delays, and order anomalies. Use thi
 ---
 ```
 
-`description` 应写清楚：
+`description` 要写清楚两件事：
 
-1. 这个 Skill 做什么
-2. 什么用户意图下应该使用它
+1. Skill 能做什么
+2. 什么意图下应该使用它
 
-不要只写：
-
-```yaml
-description: Order skill
-```
-
-这种描述很难让模型稳定完成 Skill routing。
-
-> 自动选择是模型决策，不应该把它理解成确定性的 Java `if/else`。
+自动选择是模型决策，不是 Java `if/else`，所以不能把它理解成 100% 确定性的路由。
 
 ---
 
-# 5. 生产关键流程：显式指定 Skill
+# 8. 生产关键流程为什么还要支持显式 Skill？
 
-如果业务系统本来已经知道用户点的是“订单异常分析”，没有必要再让模型猜应该使用哪个 Skill。
+如果用户是在业务系统里点击：
 
-本项目提供：
+```text
+【订单异常分析】
+```
+
+业务系统已经知道当前任务就是 `order-analysis`，没有必要再让模型猜。
+
+本项目支持：
 
 ```java
 codexAgentRuntime.startTurnWithSkill(
@@ -229,32 +367,16 @@ codexAgentRuntime.startTurnWithSkill(
 );
 ```
 
-Runtime 会基于 Agent workspace 解析：
+Runtime 根据 workspace 自动解析：
 
 ```text
 <workspace>/.agents/skills/order-analysis/SKILL.md
 ```
 
-然后在 `turn/start.input` 中加入 Skill item：
-
-```json
-[
-  {
-    "type": "text",
-    "text": "分析订单1001为什么还没收到"
-  },
-  {
-    "type": "skill",
-    "name": "order-analysis",
-    "path": "/app/.agents/skills/order-analysis/SKILL.md"
-  }
-]
-```
-
 推荐原则：
 
 ```text
-开放式 Copilot / 用户自由聊天
+自由聊天 / Copilot
         -> 自动 Skill Selection
 
 确定性的业务按钮 / Workflow / API
@@ -263,68 +385,65 @@ Runtime 会基于 Agent workspace 解析：
 
 ---
 
-# 6. Skill 与 MCP 的关系
-
-不要把 Skill 当 Tool。
+# 9. Skill 与 MCP 的关系
 
 ```text
 Skill
-= Agent 应该如何完成某类专业任务
+= 应该怎么完成任务
 
 MCP Tool
-= Agent 可以执行什么业务动作
+= 能执行什么真实业务动作
 ```
 
-本项目的 `order-analysis` Skill 会告诉 Agent：
+例如 `order-analysis` Skill：
 
-1. 识别 orderId
-2. 不允许猜订单实时状态
-3. 调用 `get_order_status`
-4. 根据业务规则解释状态
+```text
+1. 找到 orderId
+2. 不允许猜状态
+3. 调 get_order_status
+4. 根据规则解释
 5. 输出结论
+```
 
-真正订单数据由 MCP Tool 提供：
+真实数据：
 
 ```text
 Codex Harness
-   |
-   | MCP
-   v
+      |
+      | MCP
+      v
 Spring Boot MCP Server
-   |
-   v
+      |
+      v
 get_order_status
-   |
-   v
+      |
+      v
 OrderService
 ```
 
-所以一个业务 Agent 通常是：
-
-```text
-Agent = Instructions + Skills + MCP/Tools + Policies + Evals
-```
-
-Harness 负责 Agent Loop、Context、Tool orchestration 等运行时能力。
+所以 Skill 不负责替代 Tool，Tool 也不负责替代 Skill。
 
 ---
 
-# 7. MCP 三类能力
+# 10. MCP 三类能力
 
-当前 Demo 同时用于理解 MCP：
+当前 Demo 保留同一订单领域的 MCP 示例：
 
 ```text
-Tools
--> 我能做什么
+Tool
+get_order_status
+-> 执行业务查询
 
-Resources
--> 我有哪些内容可以读取
+Resource
+order://status/guide
+-> 提供订单状态说明
 
-Prompts
--> 我有哪些可复用 Prompt 模板
+Prompt
+order_analysis
+-> 提供可复用订单分析提示模板
 ```
 
-使用 MCP Inspector 测试：
+MCP Inspector 示例：
 
 ```bash
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:8080/mcp --transport http --method tools/list
@@ -336,13 +455,7 @@ npx @modelcontextprotocol/inspector --cli http://127.0.0.1:8080/mcp --transport 
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:8080/mcp --transport http --method tools/call --tool-name get_order_status --tool-arg orderId=1001
 ```
 
-资源列表：
-
-```bash
-npx @modelcontextprotocol/inspector --cli http://127.0.0.1:8080/mcp --transport http --method resources/list
-```
-
-读取资源：
+读取 Resource：
 
 ```bash
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:8080/mcp --transport http --method resources/read --uri order://status/guide
@@ -350,15 +463,9 @@ npx @modelcontextprotocol/inspector --cli http://127.0.0.1:8080/mcp --transport 
 
 ---
 
-# 8. Docker / 多环境部署
+# 11. Docker 部署时 Skill 如何被发现
 
-不要在 Java 源码里写：
-
-```text
-D:/daima/...
-```
-
-镜像推荐结构：
+推荐镜像：
 
 ```text
 /app/
@@ -366,25 +473,45 @@ D:/daima/...
 └── .agents/
     └── skills/
         └── order-analysis/
-            └── SKILL.md
+            ├── SKILL.md
+            └── references/
 ```
 
-Docker 环境：
+环境变量：
 
 ```bash
 AGENT_ORDER_WORKSPACE=/app
 CODEX_EXECUTABLE=/usr/local/bin/codex
 ```
 
-这样 Skill 与 Agent Service 版本一起发布，Java 代码不依赖开发机目录。
+运行链：
+
+```text
+Container start
+      |
+      v
+Spring Boot
+      |
+      v
+CodexAgentRuntime
+      |
+      v
+thread/start cwd=/app
+      |
+      v
+Codex Harness
+      |
+      v
+发现 /app/.agents/skills/order-analysis
+```
+
+这就是 Skill 随 Agent Service 一起版本化和部署的方式。
 
 ---
 
-# 9. 新增第二个 Agent 时怎么做
+# 12. 新增第二个 Agent
 
-例如新增 finance Agent，不要复制 `CodexAppServerClient`。
-
-增加定义：
+例如 Finance Agent：
 
 ```yaml
 agent:
@@ -401,7 +528,7 @@ agent:
         - cashflow-analysis
 ```
 
-再提供：
+对应：
 
 ```text
 /app/finance/.agents/skills/
@@ -409,11 +536,19 @@ agent:
 └── cashflow-analysis/SKILL.md
 ```
 
-所有 Agent 仍然共用同一套：
+仍然复用：
 
 ```text
 CodexAgentRuntime
 CodexAppServerClient
 ```
 
-这就是 Runtime 与业务 Agent 解耦的核心。
+不要创建：
+
+```text
+OrderCodexClient
+FinanceCodexClient
+ContractCodexClient
+```
+
+Runtime 是公共能力，Agent Definition / Skill / MCP 才是业务差异。
