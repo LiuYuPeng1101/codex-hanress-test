@@ -1,6 +1,7 @@
+import json
 from pathlib import Path
 
-from openai_codex import AsyncCodex, Sandbox
+from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
 
 class CodexRuntime:
@@ -8,11 +9,28 @@ class CodexRuntime:
 
     这一层只负责 Codex Runtime 能力，不应该放具体订单、财务、合同业务逻辑。
     FastAPI 启动时创建一份 Runtime，应用关闭时统一释放。
+
+    当前 Runtime 会把 Java 业务系统的订单 MCP Server 注入 Codex 配置。
+    Tool 的发现、参数 Schema、调用和结果回传仍由 Codex Harness 负责，
+    Python Agent Service 不自己实现 MCP Client。
     """
 
-    def __init__(self, workspace: Path) -> None:
+    def __init__(self, workspace: Path, order_mcp_url: str) -> None:
         self._workspace = workspace.resolve()
-        self._codex = AsyncCodex()
+        self._order_mcp_url = order_mcp_url
+
+        # CodexConfig.config_overrides 最终会转换成 codex --config key=value。
+        # 这里先只开放只读 Tool get_order_status，避免学习阶段把写操作暴露给 Agent。
+        # URL 使用 json.dumps 生成带引号的字符串，避免手工拼 TOML 字符串时转义出错。
+        config = CodexConfig(
+            config_overrides=(
+                f"mcp_servers.order.url={json.dumps(order_mcp_url)}",
+                'mcp_servers.order.enabled_tools=["get_order_status"]',
+                'mcp_servers.order.default_tools_approval_mode="approve"',
+            )
+        )
+
+        self._codex = AsyncCodex(config=config)
         self._started = False
 
     @property
@@ -21,11 +39,20 @@ class CodexRuntime:
 
         return self._workspace
 
+    @property
+    def order_mcp_url(self) -> str:
+        """返回当前订单 MCP Server 地址，主要用于日志、健康检查和问题排查。"""
+
+        return self._order_mcp_url
+
     async def start(self) -> None:
         """启动 Codex Runtime。
 
         AsyncCodex 使用懒初始化机制；进入异步上下文会启动底层 Codex Runtime。
         这里显式管理生命周期，方便与 FastAPI lifespan 对齐。
+
+        启动后 Codex Runtime 会读取上面的 MCP 配置；真正的 MCP 连接通常在
+        Thread/Turn 运行过程中按 Runtime 机制建立和使用。
         """
 
         if self._started:
@@ -60,6 +87,10 @@ class CodexRuntime:
 
         Turn 表示一次完整的 Agent 执行：用户输入、模型推理、Skill、MCP/Tool 调用，
         直到本轮执行完成。
+
+        例如用户询问订单 1001 状态时，order-analysis Skill 会要求不要猜测实时状态；
+        Codex Harness 可以发现订单 MCP 的 get_order_status Tool，调用 Java 业务系统，
+        再把 Tool 返回的数据交给模型生成最终答案。
         """
 
         self._ensure_started()
