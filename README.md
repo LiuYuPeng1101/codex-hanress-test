@@ -1,70 +1,102 @@
 # Codex Enterprise Agent Runtime Reference Architecture
 
-这个仓库是一个以 Codex Harness 为执行内核的企业 Agent Runtime 参考架构。
+这个仓库以 **Codex Harness** 为执行内核，构建企业 Agent Runtime 的生产级架构基线。
 
-它不是通用 Agent 平台成品，也不是订单 Agent 产品。当前订单场景用于验证企业 Agent 的核心运行链路，通用 Runtime 能力与具体业务能力严格分层。
+当前不是“万能 Agent 平台成品”，而是已经把企业 Runtime 最关键的边界落进代码：Business Conversation、可信身份、MCP 业务能力、Human Approval、多租户、Sandbox、Event、Context/Compaction、Runtime 持久化与实例路由。
 
-## 模块
+## 模块职责
+
+```text
+Enterprise Gateway
+       │
+       │ trusted user / tenant / roles
+       ▼
+codex-agent-python
+Enterprise Agent Runtime
+       │
+       │ AgentDefinition → Codex
+       ▼
+Codex Harness
+       │
+       │ MCP + trusted headers
+       ▼
+hanress-test
+Order MCP Adapter
+       │
+       ▼
+Real OMS / Business System
+```
 
 ### `codex-agent-python/`
 
-生产主路径中的 Agent Runtime / Agent Service：
+生产主路径 Runtime，负责：
 
 ```text
-FastAPI
-→ official openai-codex Python SDK
-→ Codex Harness
-→ Skill / MCP / Approval / Sandbox / Event / Context / Compaction
-```
-
-同时负责：
-
-```text
-SSE Streaming
+AgentDefinition
+Business conversation_id
+Conversation → Codex thread mapping
+Trusted Gateway identity
+Runtime instance ownership / sticky routing
+Codex Thread / Turn / Resume
+MCP Tool allow-list / Approval Policy
+Identity → MCP HTTP Headers
+PostgreSQL Approval Center
+Sandbox
+Event Mapper / SSE
 OpenTelemetry
-PostgreSQL Approval Persistence
-Thread Read / Compact API
+Context / Compaction
+CODEX_HOME persistent storage
 ```
 
-完整说明：`codex-agent-python/README.md`
+完整架构问答与真实售后案例见：`codex-agent-python/README.md`。
 
 ### `hanress-test/`
 
-目录名保留历史名称，但模块职责已经收敛为 **Order MCP Adapter**：
+目录名为历史名称，当前职责已经严格收敛为 **Order MCP Adapter**：
 
 ```text
-MCP Tool
+MCP service authentication
+→ Trusted BusinessIdentity
+→ OrderMcpTools
 → OrderService
 → OrderGateway
-→ 真实订单系统
+→ HttpOrderGateway
+→ Real OMS
 ```
 
-Java 模块不再运行 Codex、不再模拟审批、不再维护内存订单数据。
+Java 不运行 Codex、不保存 Agent Thread、不做模拟审批、不维护虚假订单。
 
-完整说明：`hanress-test/README.md`
+完整说明见：`hanress-test/README.md`。
 
 ## 当前定位
 
 ```text
 Codex Harness
-= 通用 Agent 执行内核
+= Agent execution engine
 
 codex-agent-python
-= 企业 Runtime 参考实现
+= enterprise runtime boundary / reference implementation
 
-order Skill + order MCP
-= 一个具体业务 Agent Definition
+AgentDefinition
+= 某个具体 Agent 的 workspace + sandbox + MCP + tool policy
 
-未来 Agent Gateway
-= 真正的平台控制面
+Java MCP Adapter
+= governed bridge to the system of record
 ```
 
-下一阶段重点：
+当前已经形成 Agent Gateway 的早期控制面能力，但独立 Gateway / Registry / Router 仍是下一阶段工程。
+
+## 生产原则
 
 ```text
-Business Conversation ID
-Trusted User / Tenant Context
-Runtime Routing
-多实例 Thread Persistence / Resume
-Agent Registry / Gateway
+不伪造业务数据
+不把内存当审批事实源
+不让模型声明身份
+不暴露 Codex thread_id 作为业务主键
+不让 Approval 绕过业务授权
+不直接透传 Codex Raw Event
+不在 Java/Python 运行两套 Codex Runtime
+不依赖容器临时磁盘保存 Thread
 ```
+
+CI：`.github/workflows/ci.yml` 会验证 Python + PostgreSQL Runtime 路径和 Java MCP Adapter 构建测试。
