@@ -1,5 +1,7 @@
 package com.example.hanresstest.agent.mcp;
 
+import com.example.hanresstest.security.BusinessIdentity;
+import com.example.hanresstest.security.TrustedMcpRequestContext;
 import com.example.hanresstest.service.OrderService;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
@@ -7,18 +9,20 @@ import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
 
 /**
- * 订单领域的 MCP Tool 适配器。
+ * 订单领域 MCP Tool 适配器。
  *
- * <p>这里只定义 Agent 可见的语义能力与参数，不实现业务规则，也不直接访问数据库。
- * 用户身份、租户和授权信息属于可信控制上下文，不能由模型通过 Tool 参数自行声明。</p>
+ * <p>模型只提供业务意图参数（orderId）。userId / tenantId / roles 从已经通过服务认证的
+ * MCP HTTP 请求上下文读取，模型无法自行伪造这些身份字段。</p>
  */
 @Component
 public class OrderMcpTools {
 
     private final OrderService orderService;
+    private final TrustedMcpRequestContext requestContext;
 
-    public OrderMcpTools(OrderService orderService) {
+    public OrderMcpTools(OrderService orderService, TrustedMcpRequestContext requestContext) {
         this.orderService = orderService;
+        this.requestContext = requestContext;
     }
 
     @Tool(
@@ -28,7 +32,8 @@ public class OrderMcpTools {
     public JsonNode getOrderStatus(
             @ToolParam(description = "业务订单ID") String orderId
     ) {
-        return orderService.getOrderStatus(orderId);
+        BusinessIdentity identity = requestContext.currentIdentity();
+        return orderService.getOrderStatus(orderId, identity);
     }
 
     @Tool(
@@ -38,6 +43,7 @@ public class OrderMcpTools {
     public JsonNode cancelOrder(
             @ToolParam(description = "业务订单ID") String orderId
     ) {
-        return orderService.cancelOrder(orderId);
+        BusinessIdentity identity = requestContext.currentIdentity();
+        return orderService.cancelOrder(orderId, identity);
     }
 }
