@@ -12,7 +12,11 @@ from app.schemas.agent import (
     RunTurnRequest,
     RunTurnResponse,
 )
-from app.security.gateway_auth import GatewayPrincipal, require_gateway_principal
+from app.security.gateway_auth import (
+    GatewayPrincipal,
+    require_gateway_principal,
+    require_operator_principal,
+)
 from app.services.agent_service import AgentService, RuntimeOwnershipError
 
 router = APIRouter(prefix="/agents", tags=["Agent"])
@@ -47,9 +51,9 @@ async def create_conversation(
 async def read_conversation(
     conversation_id: str,
     service: Annotated[AgentService, Depends(get_agent_service)],
-    principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
+    principal: Annotated[GatewayPrincipal, Depends(require_operator_principal)],
 ) -> ConversationReadResponse:
-    """读取受当前用户和租户约束的 Runtime 诊断快照。"""
+    """读取 Runtime 原始诊断快照，仅允许 Agent Runtime 运维角色访问。"""
 
     try:
         snapshot = await service.read_conversation(
@@ -75,8 +79,10 @@ async def read_conversation(
 async def compact_conversation(
     conversation_id: str,
     service: Annotated[AgentService, Depends(get_agent_service)],
-    principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
+    principal: Annotated[GatewayPrincipal, Depends(require_operator_principal)],
 ) -> CompactConversationResponse:
+    """人工触发 Context Compaction，仅允许 Runtime 运维角色。"""
+
     try:
         await service.compact_conversation(
             conversation_id,
@@ -136,6 +142,9 @@ async def stream_turn(
             ):
                 payload = json.dumps(event.to_dict(), ensure_ascii=False)
                 yield f"event: {event.type}\ndata: {payload}\n\n"
+        except KeyError:
+            payload = json.dumps({"code": "CONVERSATION_NOT_FOUND"}, ensure_ascii=False)
+            yield f"event: error\ndata: {payload}\n\n"
         except RuntimeOwnershipError as exc:
             payload = json.dumps(
                 {
