@@ -7,6 +7,7 @@ from redis import Redis
 from app.agents.definitions import build_order_agent
 from app.approval.approval_service import ApprovalService
 from app.approval.approval_store import ApprovalStore
+from app.conversations.repository import ConversationRepository
 from app.core.config import get_settings
 from app.observability.tracing import configure_tracing
 from app.runtime.codex_runtime import CodexRuntime
@@ -31,6 +32,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         wait_timeout_seconds=settings.approval_wait_timeout_seconds,
     )
     approval_service = ApprovalService(approval_store)
+    conversation_repository = ConversationRepository(redis)
 
     definition = build_order_agent(
         workspace=settings.agent_workspace,
@@ -44,7 +46,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.approval_service = approval_service
     app.state.codex_runtime = runtime
-    app.state.agent_service = AgentService(runtime)
+    app.state.agent_service = AgentService(runtime, conversation_repository)
 
     try:
         yield
