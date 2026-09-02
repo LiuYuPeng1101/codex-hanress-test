@@ -14,6 +14,9 @@ def _to_response(item: ApprovalRequest) -> ApprovalResponse:
     return ApprovalResponse(
         id=item.id,
         method=item.method,
+        thread_id=item.thread_id,
+        turn_id=item.turn_id,
+        server_name=item.server_name,
         params=item.params,
         status=item.status,
         created_at=item.created_at,
