@@ -3,24 +3,25 @@ from __future__ import annotations
 from typing import Any
 
 from app.approval.approval_repository import ApprovalRepository, ApprovalTimeoutError
+from app.conversations.conversation_repository import ConversationRepository
 
 
 class ApprovalService:
-    """连接 Codex approval handler 与企业审批中心的应用服务。"""
+    """连接 Codex approval handler 与企业多租户审批中心。"""
 
     MCP_APPROVAL_METHOD = "mcpServer/elicitation/request"
 
-    def __init__(self, repository: ApprovalRepository, timeout_seconds: int) -> None:
+    def __init__(
+        self,
+        repository: ApprovalRepository,
+        conversations: ConversationRepository,
+        timeout_seconds: int,
+    ) -> None:
         self._repository = repository
+        self._conversations = conversations
         self._timeout_seconds = timeout_seconds
 
     def handle_codex_request(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
-        """处理 Codex App Server 主动发来的 MCP Tool Approval 请求。
-
-        只有 `codex_approval_kind=mcp_tool_call` 才进入企业审批流程。审批记录先持久化，
-        然后同步等待外部审批中心写入 approve/reject；等待超时按拒绝处理，避免危险操作失控。
-        """
-
         payload = params or {}
         if method != self.MCP_APPROVAL_METHOD:
             return {}
@@ -29,7 +30,23 @@ class ApprovalService:
         if meta.get("codex_approval_kind") != "mcp_tool_call":
             return {}
 
-        approval = self._repository.create(method, payload)
+        thread_id = payload.get("threadId") or payload.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id:
+            return {"action": "decline", "content": None}
+
+        try:
+            conversation = self._conversations.find_by_runtime_thread_id(thread_id)
+        except KeyError:
+            # 来源不明的 Runtime Thread 不能进入企业审批中心，更不能执行写操作。
+            return {"action": "decline", "content": None}
+
+        approval = self._repository.create(
+            method,
+            payload,
+            conversation_id=conversation.id,
+            requester_user_id=conversation.user_id,
+            tenant_id=conversation.tenant_id,
+        )
         try:
             decision = self._repository.wait_for_decision(
                 approval.id,
@@ -42,15 +59,15 @@ class ApprovalService:
             return {"action": "accept", "content": {}}
         return {"action": "decline", "content": None}
 
-    def list_approvals(self):
-        return self._repository.list_all()
+    def list_approvals(self, *, tenant_id: str):
+        return self._repository.list_for_tenant(tenant_id)
 
     def approve(self, approval_id: str, *, user_id: str, tenant_id: str):
         return self._repository.decide(
             approval_id,
             "approve",
             decided_by=user_id,
-            decided_tenant_id=tenant_id,
+            tenant_id=tenant_id,
         )
 
     def reject(self, approval_id: str, *, user_id: str, tenant_id: str):
@@ -58,5 +75,5 @@ class ApprovalService:
             approval_id,
             "reject",
             decided_by=user_id,
-            decided_tenant_id=tenant_id,
+            tenant_id=tenant_id,
         )
