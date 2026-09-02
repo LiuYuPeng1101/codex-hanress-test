@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "fakeredis>=2.31,<3.0",
     "httpx>=0.28,<1.0",
     "pytest>=8.4,<9.0",
     "pytest-asyncio>=1.1,<2.0",
