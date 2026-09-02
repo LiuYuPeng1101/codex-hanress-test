@@ -4,7 +4,17 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, MetaData, String, Table, create_engine, insert, select, text
+from sqlalchemy import (
+    Column,
+    DateTime,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    insert,
+    select,
+    text,
+)
 from sqlalchemy.engine import Engine
 
 
@@ -76,7 +86,18 @@ class ConversationRepository:
             created_at=datetime.now(timezone.utc),
         )
         with self._engine.begin() as conn:
-            conn.execute(insert(conversations).values(**item.__dict__))
+            conn.execute(
+                insert(conversations).values(
+                    id=item.id,
+                    agent_id=item.agent_id,
+                    tenant_id=item.tenant_id,
+                    user_id=item.user_id,
+                    runtime_type=item.runtime_type,
+                    runtime_thread_id=item.runtime_thread_id,
+                    runtime_instance_id=item.runtime_instance_id,
+                    created_at=item.created_at,
+                )
+            )
         return item
 
     def get_owned(self, conversation_id: str, *, tenant_id: str, user_id: str) -> Conversation:
