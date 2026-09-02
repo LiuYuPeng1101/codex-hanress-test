@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.agents.definition import AgentDefinition, McpServerDefinition, SandboxPolicy
 from app.approval.approval_repository import ApprovalRepository
 from app.approval.approval_service import ApprovalService
 from app.conversations.conversation_repository import ConversationRepository
@@ -36,11 +37,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         timeout_seconds=settings.approval_timeout_seconds,
     )
 
+    definition = AgentDefinition(
+        agent_id=settings.agent_id,
+        workspace=str(settings.agent_workspace),
+        sandbox=SandboxPolicy.READ_ONLY,
+        mcp_servers=(
+            McpServerDefinition(
+                name="order",
+                url=settings.order_mcp_url,
+                service_token=settings.order_mcp_service_token,
+                enabled_tools=("get_order_status", "cancel_order"),
+                tool_approval_modes=(
+                    ("get_order_status", "approve"),
+                    ("cancel_order", "prompt"),
+                ),
+            ),
+        ),
+    )
+
     runtime = CodexRuntime(
-        workspace=settings.agent_workspace,
+        definition=definition,
         codex_home=settings.codex_home,
-        order_mcp_url=settings.order_mcp_url,
-        order_mcp_service_token=settings.order_mcp_service_token,
         approval_handler=approval_service.handle_codex_request,
     )
     await runtime.start()
@@ -48,7 +65,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     agent_service = AgentService(
         runtime,
         conversation_repository,
-        agent_id=settings.agent_id,
+        agent_id=definition.agent_id,
         runtime_instance_id=settings.runtime_instance_id,
     )
 
