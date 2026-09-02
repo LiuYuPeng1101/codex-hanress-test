@@ -2,13 +2,14 @@ import threading
 import time
 
 import fakeredis
+import pytest
 
 from app.approval.approval_store import ApprovalStore
 
 
-def _store() -> ApprovalStore:
+def _store(*, timeout: int = 2) -> ApprovalStore:
     redis = fakeredis.FakeRedis(decode_responses=False)
-    return ApprovalStore(redis, wait_timeout_seconds=2)
+    return ApprovalStore(redis, wait_timeout_seconds=timeout)
 
 
 def test_approval_store_can_approve_and_wake_waiter() -> None:
@@ -34,3 +35,14 @@ def test_approval_store_can_reject() -> None:
 
     assert store.wait_for_decision(item.id) == "reject"
     assert updated.status == "REJECTED"
+
+
+def test_expired_approval_cannot_be_approved() -> None:
+    store = _store()
+    item = store.create("mcpServer/elicitation/request", {"meta": {}})
+
+    expired = store.expire(item.id)
+
+    assert expired.status == "EXPIRED"
+    with pytest.raises(ValueError):
+        store.decide(item.id, "approve")
