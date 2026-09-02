@@ -13,33 +13,28 @@ from openai_codex.generated.v2_all import (
     ThreadStartParams,
 )
 
+from app.agents.definition import AgentDefinition, SandboxPolicy
 from app.events.codex_event_mapper import CodexEventMapper
 from app.events.models import AgentEvent
 from app.observability.tracing import get_tracer
 
 
 class CodexRuntime:
-    """官方 OpenAI Codex Python SDK 的企业 Runtime Adapter。
+    """把企业 AgentDefinition 适配到官方 Codex Harness。
 
-    Runtime 只处理 Codex Thread / Turn / Sandbox / Approval / Event / Context 等执行能力。
-    业务 conversation_id、身份和租户属于上层控制面，但 Runtime 负责：
-
-    - 把可信身份作为 MCP HTTP Header 注入 Thread 配置；
-    - 固定 CODEX_HOME，使 Thread 状态落到持久化卷，而不是容器临时文件系统；
-    - 隔离当前 SDK 仍需使用的私有 Approval Handler 适配。
+    这一层不包含订单、合同、财务等业务名词。它负责把控制面定义翻译成 Codex 的：
+    Thread、MCP 配置、Tool allow-list、Approval Policy、Sandbox、Event 与 Context 生命周期。
     """
 
     def __init__(
         self,
-        workspace: Path,
+        definition: AgentDefinition,
         codex_home: Path,
-        order_mcp_url: str,
-        order_mcp_service_token: str,
         approval_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
     ) -> None:
-        self._workspace = workspace.resolve()
+        self._definition = definition
+        self._workspace = Path(definition.workspace).resolve()
         self._codex_home = codex_home.resolve()
-        self._order_mcp_service_token = order_mcp_service_token
         self._event_mapper = CodexEventMapper()
         self._tracer = get_tracer()
 
@@ -50,22 +45,21 @@ class CodexRuntime:
         runtime_env = dict(os.environ)
         runtime_env["CODEX_HOME"] = str(self._codex_home)
 
-        config = CodexConfig(
-            env=runtime_env,
-            config_overrides=(
-                f"mcp_servers.order.url={json.dumps(order_mcp_url)}",
-                'mcp_servers.order.enabled_tools=["get_order_status","cancel_order"]',
-                'mcp_servers.order.default_tools_approval_mode="approve"',
-                'mcp_servers.order.tools.get_order_status.approval_mode="approve"',
-                'mcp_servers.order.tools.cancel_order.approval_mode="prompt"',
-            ),
+        self._codex = AsyncCodex(
+            config=CodexConfig(
+                env=runtime_env,
+                config_overrides=self._build_mcp_config_overrides(),
+            )
         )
-        self._codex = AsyncCodex(config=config)
 
         # 当前高层 AsyncCodex 尚未直接暴露人工 approval handler。
-        # 私有 SDK 适配被严格限制在 Runtime Adapter 内，避免上层代码依赖 SDK 内部结构。
+        # 私有 SDK 适配被严格限制在 Runtime Adapter 内；SDK 升级时只需修改这一处。
         self._codex._client._sync._approval_handler = approval_handler
         self._started = False
+
+    @property
+    def agent_id(self) -> str:
+        return self._definition.agent_id
 
     async def start(self) -> None:
         if self._started:
@@ -86,16 +80,13 @@ class CodexRuntime:
         tenant_id: str,
         roles: frozenset[str],
     ) -> str:
-        """创建人工 reviewer + read-only Sandbox 的 Codex Thread。
-
-        `config` 中注入的 MCP Header 属于 Runtime 控制面，不出现在用户 Prompt 或 Tool Schema 中。
-        """
+        """创建带人工 reviewer、最小 Sandbox 与可信 MCP 身份的 Codex Thread。"""
 
         self._ensure_started()
         params = ThreadStartParams(
             approval_policy=AskForApproval(root=AskForApprovalValue.on_request),
             approvals_reviewer=ApprovalsReviewer.user,
-            sandbox=SandboxMode.read_only,
+            sandbox=self._sandbox_mode(),
             config=self._mcp_identity_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
             cwd=str(self._workspace),
         )
@@ -114,7 +105,6 @@ class CodexRuntime:
         tenant_id: str,
         roles: frozenset[str],
     ) -> dict[str, Any]:
-        self._ensure_started()
         thread = await self._resume_thread(
             thread_id,
             user_id=user_id,
@@ -132,7 +122,6 @@ class CodexRuntime:
         tenant_id: str,
         roles: frozenset[str],
     ) -> None:
-        self._ensure_started()
         thread = await self._resume_thread(
             thread_id,
             user_id=user_id,
@@ -151,14 +140,9 @@ class CodexRuntime:
         tenant_id: str,
         roles: frozenset[str],
     ) -> str:
-        self._ensure_started()
         with self._tracer.start_as_current_span("agent.turn") as span:
-            span.set_attribute("agent.conversation.id", conversation_id)
-            span.set_attribute("agent.runtime.thread.id", thread_id)
-            span.set_attribute("enduser.id", user_id)
-            span.set_attribute("tenant.id", tenant_id)
+            self._set_common_span_attributes(span, conversation_id, thread_id, user_id, tenant_id)
             span.set_attribute("agent.streaming", False)
-            span.set_attribute("agent.sandbox", Sandbox.read_only.value)
 
             thread = await self._resume_thread(
                 thread_id,
@@ -166,7 +150,7 @@ class CodexRuntime:
                 tenant_id=tenant_id,
                 roles=roles,
             )
-            result = await thread.run(message, sandbox=Sandbox.read_only)
+            result = await thread.run(message, sandbox=self._sandbox())
 
             span.set_attribute("agent.runtime.turn.id", result.id)
             span.set_attribute("agent.turn.status", str(result.status))
@@ -184,29 +168,23 @@ class CodexRuntime:
         tenant_id: str,
         roles: frozenset[str],
     ) -> AsyncIterator[AgentEvent]:
-        self._ensure_started()
         thread = await self._resume_thread(
             thread_id,
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
         )
-        turn = await thread.turn(message, sandbox=Sandbox.read_only)
+        turn = await thread.turn(message, sandbox=self._sandbox())
 
         with self._tracer.start_as_current_span("agent.turn.stream") as span:
-            span.set_attribute("agent.conversation.id", conversation_id)
-            span.set_attribute("agent.runtime.thread.id", thread_id)
+            self._set_common_span_attributes(span, conversation_id, thread_id, user_id, tenant_id)
             span.set_attribute("agent.runtime.turn.id", turn.id)
-            span.set_attribute("enduser.id", user_id)
-            span.set_attribute("tenant.id", tenant_id)
             span.set_attribute("agent.streaming", True)
-            span.set_attribute("agent.sandbox", Sandbox.read_only.value)
 
             async for notification in turn.stream():
                 event = self._event_mapper.map(notification, conversation_id)
                 if event is None:
                     continue
-
                 attributes: dict[str, str] = {
                     "agent.event.type": event.type,
                     "agent.conversation.id": conversation_id,
@@ -227,14 +205,32 @@ class CodexRuntime:
         tenant_id: str,
         roles: frozenset[str],
     ) -> AsyncThread:
-        """恢复 Thread 时重新注入当前可信身份，避免长期会话使用过期角色。"""
+        """恢复 Thread 时重新注入当前可信身份，避免长期会话沿用过期角色。"""
 
+        self._ensure_started()
         return await self._codex.thread_resume(
             thread_id,
             cwd=str(self._workspace),
-            sandbox=Sandbox.read_only,
+            sandbox=self._sandbox(),
             config=self._mcp_identity_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
         )
+
+    def _build_mcp_config_overrides(self) -> tuple[str, ...]:
+        overrides: list[str] = []
+        for server in self._definition.mcp_servers:
+            prefix = f"mcp_servers.{server.name}"
+            overrides.extend(
+                [
+                    f"{prefix}.url={json.dumps(server.url)}",
+                    f"{prefix}.enabled_tools={json.dumps(list(server.enabled_tools))}",
+                    f"{prefix}.default_tools_approval_mode={json.dumps(server.default_approval_mode)}",
+                ]
+            )
+            for tool_name, approval_mode in server.tool_approval_modes:
+                overrides.append(
+                    f"{prefix}.tools.{tool_name}.approval_mode={json.dumps(approval_mode)}"
+                )
+        return tuple(overrides)
 
     def _mcp_identity_config(
         self,
@@ -243,16 +239,47 @@ class CodexRuntime:
         tenant_id: str,
         roles: frozenset[str],
     ) -> dict[str, Any]:
-        """构造 Codex Thread 级 MCP HTTP Header 配置。"""
+        """把可信身份放入每个 MCP Server 的 HTTP Header，而不是 Tool 参数。"""
 
-        return {
-            "mcp_servers.order.http_headers": {
-                "Authorization": f"Bearer {self._order_mcp_service_token}",
+        config: dict[str, Any] = {}
+        for server in self._definition.mcp_servers:
+            config[f"mcp_servers.{server.name}.http_headers"] = {
+                "Authorization": f"Bearer {server.service_token}",
                 "X-User-Id": user_id,
                 "X-Tenant-Id": tenant_id,
                 "X-Roles": ",".join(sorted(roles)),
             }
-        }
+        return config
+
+    def _sandbox(self) -> Sandbox:
+        return {
+            SandboxPolicy.READ_ONLY: Sandbox.read_only,
+            SandboxPolicy.WORKSPACE_WRITE: Sandbox.workspace_write,
+            SandboxPolicy.FULL_ACCESS: Sandbox.full_access,
+        }[self._definition.sandbox]
+
+    def _sandbox_mode(self) -> SandboxMode:
+        return {
+            SandboxPolicy.READ_ONLY: SandboxMode.read_only,
+            SandboxPolicy.WORKSPACE_WRITE: SandboxMode.workspace_write,
+            SandboxPolicy.FULL_ACCESS: SandboxMode.danger_full_access,
+        }[self._definition.sandbox]
+
+    def _set_common_span_attributes(
+        self,
+        span: Any,
+        conversation_id: str,
+        thread_id: str,
+        user_id: str,
+        tenant_id: str,
+    ) -> None:
+        span.set_attribute("agent.id", self._definition.agent_id)
+        span.set_attribute("agent.conversation.id", conversation_id)
+        span.set_attribute("agent.runtime.type", "codex")
+        span.set_attribute("agent.runtime.thread.id", thread_id)
+        span.set_attribute("agent.sandbox", self._sandbox().value)
+        span.set_attribute("enduser.id", user_id)
+        span.set_attribute("tenant.id", tenant_id)
 
     def _ensure_started(self) -> None:
         if not self._started:
