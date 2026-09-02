@@ -3,11 +3,12 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Callable
 
-from openai_codex import AsyncCodex, AsyncThread, CodexConfig
+from openai_codex import AsyncCodex, AsyncThread, CodexConfig, Sandbox
 from openai_codex.generated.v2_all import (
     ApprovalsReviewer,
     AskForApproval,
     AskForApprovalValue,
+    SandboxMode,
     ThreadStartParams,
 )
 
@@ -24,6 +25,10 @@ class CodexRuntime:
 
     当前 Runtime 会把 Java 业务系统的订单 MCP Server 注入 Codex 配置，并把
     MCP 写操作的 Approval Server Request 转给上层 ApprovalService 处理。
+
+    当前订单 Agent 采用最小权限原则：本地 Sandbox 固定为 read-only。
+    Agent 可以读取 workspace 中的 Skill / 文档 / 源码，但不能修改本地文件。
+    真实订单写操作仍通过受治理的 MCP Tool + Approval + Java 业务权限执行。
     """
 
     def __init__(
@@ -85,35 +90,47 @@ class CodexRuntime:
         self._started = False
 
     async def create_thread(self) -> str:
-        """创建使用“人工 reviewer”的 Codex Thread。
+        """创建使用人工 reviewer + read-only Sandbox 的 Codex Thread。
 
-        官方高层 ApprovalMode 当前主要暴露 auto_review / deny_all；底层 typed protocol
-        已支持 ApprovalsReviewer.user，所以这里通过 SDK 自带的底层 typed client 创建 Thread。
-        这样 MCP prompt approval 会真正路由到我们注入的 approval_handler，而不是自动审核。
+        这里同时明确两类安全边界：
+
+        1. Approval：高风险 MCP 写操作交给真实用户审批；
+        2. Sandbox：Agent 本地执行环境只允许读取，不允许修改 workspace 文件。
+
+        二者不是替代关系。即使某个业务 Tool 获得 Approval，本地文件系统仍然保持只读。
         """
 
         self._ensure_started()
         params = ThreadStartParams(
             approval_policy=AskForApproval(root=AskForApprovalValue.on_request),
             approvals_reviewer=ApprovalsReviewer.user,
+            sandbox=SandboxMode.read_only,
             cwd=str(self._workspace),
         )
         started = await self._codex._client.thread_start(params)
         return started.thread.id
 
     async def run_turn(self, thread_id: str, message: str) -> str:
-        """执行一轮非流式 Turn，兼容原有一次性返回最终答案的 API。"""
+        """执行一轮非流式 Turn，兼容原有一次性返回最终答案的 API。
+
+        Turn 层再次显式传入 Sandbox.read_only，避免依赖 Runtime 或历史 Thread 的隐式默认值。
+        这样这个订单 Agent 的最小权限策略在代码上始终可见。
+        """
 
         self._ensure_started()
         with self._tracer.start_as_current_span("agent.turn") as span:
             span.set_attribute("agent.thread.id", thread_id)
             span.set_attribute("agent.streaming", False)
+            span.set_attribute("agent.sandbox", Sandbox.read_only.value)
 
             thread: AsyncThread = await self._codex.thread_resume(
                 thread_id,
                 cwd=str(self._workspace),
             )
-            result = await thread.run(message)
+            result = await thread.run(
+                message,
+                sandbox=Sandbox.read_only,
+            )
 
             span.set_attribute("agent.turn.id", result.id)
             span.set_attribute("agent.turn.status", str(result.status))
@@ -126,7 +143,7 @@ class CodexRuntime:
         """执行一轮流式 Turn，并逐条输出经过安全映射的 AgentEvent。
 
         使用官方公开的 AsyncThread.turn() + AsyncTurnHandle.stream()，而不是自己读取
-        App Server stdout。这样不同 Turn 的 Notification 仍由 SDK 按 turn_id 正确路由。
+        App Server stdout。流式 Turn 与非流式 Turn 使用同一套 read-only Sandbox 策略。
         """
 
         self._ensure_started()
@@ -134,12 +151,16 @@ class CodexRuntime:
             thread_id,
             cwd=str(self._workspace),
         )
-        turn = await thread.turn(message)
+        turn = await thread.turn(
+            message,
+            sandbox=Sandbox.read_only,
+        )
 
         with self._tracer.start_as_current_span("agent.turn.stream") as span:
             span.set_attribute("agent.thread.id", thread_id)
             span.set_attribute("agent.turn.id", turn.id)
             span.set_attribute("agent.streaming", True)
+            span.set_attribute("agent.sandbox", Sandbox.read_only.value)
 
             async for notification in turn.stream():
                 event = self._event_mapper.map(notification, thread_id, turn.id)
