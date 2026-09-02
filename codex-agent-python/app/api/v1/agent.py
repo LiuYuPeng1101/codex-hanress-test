@@ -1,83 +1,119 @@
 import json
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import get_agent_service
 from app.schemas.agent import (
-    CompactThreadResponse,
-    CreateThreadResponse,
+    CompactConversationResponse,
+    ConversationReadResponse,
+    CreateConversationResponse,
     RunTurnRequest,
     RunTurnResponse,
-    ThreadReadResponse,
 )
 from app.services.agent_service import AgentService
 
 router = APIRouter(prefix="/agents", tags=["Agent"])
 
 
-@router.post("/threads", response_model=CreateThreadResponse)
-async def create_thread(
+@router.post("/{agent_id}/conversations", response_model=CreateConversationResponse)
+async def create_conversation(
+    agent_id: str,
     service: Annotated[AgentService, Depends(get_agent_service)],
-) -> CreateThreadResponse:
-    """创建一个新的 Codex Thread。"""
+) -> CreateConversationResponse:
+    """创建平台级业务 Conversation，不向调用方暴露 Codex Thread ID。"""
 
-    thread_id = await service.create_conversation()
-    return CreateThreadResponse(thread_id=thread_id)
+    try:
+        conversation = await service.create_conversation(agent_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Agent 不存在") from exc
+    return CreateConversationResponse(
+        conversation_id=conversation.id,
+        agent_id=conversation.agent_id,
+        created_at=conversation.created_at,
+    )
 
 
-@router.get("/threads/{thread_id}", response_model=ThreadReadResponse)
-async def read_thread(
-    thread_id: str,
+@router.get(
+    "/{agent_id}/conversations/{conversation_id}",
+    response_model=ConversationReadResponse,
+)
+async def read_conversation(
+    agent_id: str,
+    conversation_id: str,
     service: Annotated[AgentService, Depends(get_agent_service)],
-) -> ThreadReadResponse:
-    """读取 Thread 快照，并包含 Turn 历史。
+) -> ConversationReadResponse:
+    """读取 Conversation 对应的 Runtime Thread 状态，用于受控诊断与管理。"""
 
-    这个接口用于观察“持久化 Thread 历史”，不要把它误解成模型下一轮一定会原样看到的
-    Effective Context。Context 可能经过 Harness 的裁剪、替换或 Compaction。
-    """
+    try:
+        conversation = service.get_conversation(agent_id, conversation_id)
+        snapshot = await service.read_conversation(agent_id, conversation_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
+    return ConversationReadResponse(
+        conversation_id=conversation.id,
+        agent_id=conversation.agent_id,
+        runtime=conversation.runtime,
+        thread=snapshot["thread"],
+    )
 
-    snapshot = await service.read_conversation(thread_id)
-    return ThreadReadResponse(thread=snapshot["thread"])
 
-
-@router.post("/threads/{thread_id}/compact", response_model=CompactThreadResponse)
-async def compact_thread(
-    thread_id: str,
+@router.post(
+    "/{agent_id}/conversations/{conversation_id}/compact",
+    response_model=CompactConversationResponse,
+)
+async def compact_conversation(
+    agent_id: str,
+    conversation_id: str,
     service: Annotated[AgentService, Depends(get_agent_service)],
-) -> CompactThreadResponse:
-    """触发 Thread 手动 Compaction。
+) -> CompactConversationResponse:
+    """触发 Runtime Thread Compaction；响应只表示请求已被 Codex 接受。"""
 
-    官方底层接口是 `thread/compact/start`，因此这里只表示压缩已成功发起。
-    """
+    try:
+        await service.compact_conversation(agent_id, conversation_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
+    return CompactConversationResponse(
+        conversation_id=conversation_id,
+        status="COMPACTION_STARTED",
+    )
 
-    await service.compact_conversation(thread_id)
-    return CompactThreadResponse(thread_id=thread_id, status="COMPACTION_STARTED")
 
-
-@router.post("/threads/{thread_id}/turns", response_model=RunTurnResponse)
+@router.post(
+    "/{agent_id}/conversations/{conversation_id}/turns",
+    response_model=RunTurnResponse,
+)
 async def run_turn(
-    thread_id: str,
+    agent_id: str,
+    conversation_id: str,
     request: RunTurnRequest,
     service: Annotated[AgentService, Depends(get_agent_service)],
 ) -> RunTurnResponse:
-    """在已有 Thread 中执行一轮非流式 Turn。"""
+    try:
+        answer = await service.chat(agent_id, conversation_id, request.message)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
+    return RunTurnResponse(conversation_id=conversation_id, answer=answer)
 
-    answer = await service.chat(thread_id, request.message)
-    return RunTurnResponse(thread_id=thread_id, answer=answer)
 
-
-@router.post("/threads/{thread_id}/turns/stream")
+@router.post("/{agent_id}/conversations/{conversation_id}/turns/stream")
 async def stream_turn(
-    thread_id: str,
+    agent_id: str,
+    conversation_id: str,
     request: RunTurnRequest,
     service: Annotated[AgentService, Depends(get_agent_service)],
 ) -> StreamingResponse:
-    """通过 SSE 实时推送一轮 Turn 的标准化 Agent Event。"""
+    """通过 SSE 输出稳定 AgentEvent；不暴露 Codex 私有事件协议。"""
+
+    # 在返回 StreamingResponse 前先验证 Conversation，避免已开始 SSE 后才返回 404。
+    try:
+        service.get_conversation(agent_id, conversation_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
 
     async def event_stream():
-        async for event in service.stream_chat(thread_id, request.message):
+        async for event in service.stream_chat(agent_id, conversation_id, request.message):
             payload = json.dumps(event.to_dict(), ensure_ascii=False)
             yield f"event: {event.type}\ndata: {payload}\n\n"
 
