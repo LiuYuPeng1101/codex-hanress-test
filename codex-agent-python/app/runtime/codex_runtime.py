@@ -21,16 +21,19 @@ class CodexRuntime:
     """官方 OpenAI Codex Python SDK 的企业 Runtime Adapter。
 
     Runtime 只处理 Codex Thread / Turn / Sandbox / Approval / Event / Context 等执行能力。
-    业务 conversation_id、用户、租户和 Agent Definition 由上层控制面管理。
+    业务 conversation_id、身份和租户属于上层控制面，但 Runtime 负责把可信身份作为
+    MCP HTTP Header 注入 Codex Thread 配置，确保业务身份不进入模型可伪造的 Tool 参数。
     """
 
     def __init__(
         self,
         workspace: Path,
         order_mcp_url: str,
+        order_mcp_service_token: str,
         approval_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
     ) -> None:
         self._workspace = workspace.resolve()
+        self._order_mcp_service_token = order_mcp_service_token
         self._event_mapper = CodexEventMapper()
         self._tracer = get_tracer()
 
@@ -46,7 +49,7 @@ class CodexRuntime:
         self._codex = AsyncCodex(config=config)
 
         # 当前高层 AsyncCodex 尚未直接暴露人工 approval handler。
-        # 这段私有 SDK 适配被严格限制在 Runtime Adapter 内。
+        # 私有 SDK 适配被严格限制在 Runtime Adapter 内，避免上层代码依赖 SDK 内部结构。
         self._codex._client._sync._approval_handler = approval_handler
         self._started = False
 
@@ -62,39 +65,65 @@ class CodexRuntime:
         await self._codex.__aexit__(None, None, None)
         self._started = False
 
-    async def create_thread(self) -> str:
-        """创建人工 reviewer + read-only Sandbox 的 Codex Thread。"""
+    async def create_thread(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> str:
+        """创建人工 reviewer + read-only Sandbox 的 Codex Thread。
+
+        `config` 中注入的 MCP Header 属于 Runtime 控制面，不出现在用户 Prompt 或 Tool Schema 中。
+        """
 
         self._ensure_started()
         params = ThreadStartParams(
             approval_policy=AskForApproval(root=AskForApprovalValue.on_request),
             approvals_reviewer=ApprovalsReviewer.user,
             sandbox=SandboxMode.read_only,
+            config=self._mcp_identity_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
             cwd=str(self._workspace),
         )
         started = await self._codex._client.thread_start(params)
         return started.thread.id
 
     async def archive_thread(self, thread_id: str) -> None:
-        """归档无法绑定到业务 Conversation 的孤儿 Thread。"""
-
         self._ensure_started()
         await self._codex.thread_archive(thread_id)
 
-    async def read_thread(self, thread_id: str) -> dict[str, Any]:
+    async def read_thread(
+        self,
+        thread_id: str,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> dict[str, Any]:
         self._ensure_started()
-        thread: AsyncThread = await self._codex.thread_resume(
+        thread = await self._resume_thread(
             thread_id,
-            cwd=str(self._workspace),
+            user_id=user_id,
+            tenant_id=tenant_id,
+            roles=roles,
         )
         response = await thread.read(include_turns=True)
         return response.model_dump(by_alias=True, mode="json")
 
-    async def compact_thread(self, thread_id: str) -> None:
+    async def compact_thread(
+        self,
+        thread_id: str,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> None:
         self._ensure_started()
-        thread: AsyncThread = await self._codex.thread_resume(
+        thread = await self._resume_thread(
             thread_id,
-            cwd=str(self._workspace),
+            user_id=user_id,
+            tenant_id=tenant_id,
+            roles=roles,
         )
         await thread.compact()
 
@@ -103,17 +132,25 @@ class CodexRuntime:
         thread_id: str,
         conversation_id: str,
         message: str,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
     ) -> str:
         self._ensure_started()
         with self._tracer.start_as_current_span("agent.turn") as span:
             span.set_attribute("agent.conversation.id", conversation_id)
             span.set_attribute("agent.runtime.thread.id", thread_id)
+            span.set_attribute("enduser.id", user_id)
+            span.set_attribute("tenant.id", tenant_id)
             span.set_attribute("agent.streaming", False)
             span.set_attribute("agent.sandbox", Sandbox.read_only.value)
 
-            thread: AsyncThread = await self._codex.thread_resume(
+            thread = await self._resume_thread(
                 thread_id,
-                cwd=str(self._workspace),
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
             )
             result = await thread.run(message, sandbox=Sandbox.read_only)
 
@@ -128,11 +165,17 @@ class CodexRuntime:
         thread_id: str,
         conversation_id: str,
         message: str,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
     ) -> AsyncIterator[AgentEvent]:
         self._ensure_started()
-        thread: AsyncThread = await self._codex.thread_resume(
+        thread = await self._resume_thread(
             thread_id,
-            cwd=str(self._workspace),
+            user_id=user_id,
+            tenant_id=tenant_id,
+            roles=roles,
         )
         turn = await thread.turn(message, sandbox=Sandbox.read_only)
 
@@ -140,6 +183,8 @@ class CodexRuntime:
             span.set_attribute("agent.conversation.id", conversation_id)
             span.set_attribute("agent.runtime.thread.id", thread_id)
             span.set_attribute("agent.runtime.turn.id", turn.id)
+            span.set_attribute("enduser.id", user_id)
+            span.set_attribute("tenant.id", tenant_id)
             span.set_attribute("agent.streaming", True)
             span.set_attribute("agent.sandbox", Sandbox.read_only.value)
 
@@ -159,6 +204,41 @@ class CodexRuntime:
                     attributes["agent.tool.name"] = str(tool_name)
                 span.add_event(event.type, attributes=attributes)
                 yield event
+
+    async def _resume_thread(
+        self,
+        thread_id: str,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> AsyncThread:
+        """恢复 Thread 时重新注入当前可信身份，避免长期会话使用过期角色。"""
+
+        return await self._codex.thread_resume(
+            thread_id,
+            cwd=str(self._workspace),
+            sandbox=Sandbox.read_only,
+            config=self._mcp_identity_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
+        )
+
+    def _mcp_identity_config(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> dict[str, Any]:
+        """构造 Codex Thread 级 MCP HTTP Header 配置。"""
+
+        return {
+            "mcp_servers.order.http_headers": {
+                "Authorization": f"Bearer {self._order_mcp_service_token}",
+                "X-User-Id": user_id,
+                "X-Tenant-Id": tenant_id,
+                "X-Roles": ",".join(sorted(roles)),
+            }
+        }
 
     def _ensure_started(self) -> None:
         if not self._started:
