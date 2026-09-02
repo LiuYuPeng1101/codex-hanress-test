@@ -6,7 +6,18 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Column, DateTime, MetaData, String, Table, create_engine, insert, select, text, update
+from sqlalchemy import (
+    Column,
+    DateTime,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    insert,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
 
@@ -25,6 +36,8 @@ class ApprovalRequest:
     created_at: datetime
     decided_at: datetime | None
     decision: str | None
+    decided_by: str | None
+    decided_tenant_id: str | None
 
 
 class ApprovalTimeoutError(TimeoutError):
@@ -44,6 +57,8 @@ approval_requests = Table(
     Column("params", JSONB, nullable=False),
     Column("status", String(32), nullable=False),
     Column("decision", String(32), nullable=True),
+    Column("decided_by", String(128), nullable=True),
+    Column("decided_tenant_id", String(128), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("decided_at", DateTime(timezone=True), nullable=True),
 )
@@ -83,6 +98,8 @@ class ApprovalRepository:
             created_at=now,
             decided_at=None,
             decision=None,
+            decided_by=None,
+            decided_tenant_id=None,
         )
         with self._engine.begin() as conn:
             conn.execute(
@@ -113,7 +130,14 @@ class ApprovalRepository:
             raise KeyError(approval_id)
         return self._from_row(row)
 
-    def decide(self, approval_id: str, decision: str) -> ApprovalRequest:
+    def decide(
+        self,
+        approval_id: str,
+        decision: str,
+        *,
+        decided_by: str,
+        decided_tenant_id: str,
+    ) -> ApprovalRequest:
         if decision not in {"approve", "reject"}:
             raise ValueError("decision 只能是 approve 或 reject")
 
@@ -125,7 +149,13 @@ class ApprovalRepository:
                 approval_requests.c.id == approval_id,
                 approval_requests.c.status == "PENDING",
             )
-            .values(status=new_status, decision=decision, decided_at=now)
+            .values(
+                status=new_status,
+                decision=decision,
+                decided_by=decided_by,
+                decided_tenant_id=decided_tenant_id,
+                decided_at=now,
+            )
         )
         with self._engine.begin() as conn:
             result = conn.execute(stmt)
@@ -193,4 +223,6 @@ class ApprovalRepository:
             created_at=row["created_at"],
             decided_at=row["decided_at"],
             decision=row["decision"],
+            decided_by=row["decided_by"],
+            decided_tenant_id=row["decided_tenant_id"],
         )
