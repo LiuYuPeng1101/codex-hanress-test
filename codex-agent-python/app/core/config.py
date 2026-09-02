@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     agent_workspace: Path = Path(".")
     agent_id: str = "order-agent"
     runtime_instance_id: str = Field(description="当前 Runtime 实例唯一标识，用于 Thread 路由")
+    codex_home: Path = Field(description="Codex 持久化目录；生产环境必须挂载持久卷")
 
     order_mcp_url: str = Field(description="订单 MCP Adapter 地址")
     order_mcp_service_token: str = Field(
