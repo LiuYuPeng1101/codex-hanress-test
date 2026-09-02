@@ -11,6 +11,11 @@ spring:
         streamable-http:
           mcp-endpoint: /mcp
 
+mcp:
+  security:
+    # Agent Runtime -> MCP Adapter 的服务认证密钥，必须由 Secret Manager 注入。
+    service-token: ${MCP_SERVICE_TOKEN}
+
 order-service:
   # 真实订单系统地址和服务凭据必须由部署环境注入，不允许使用内存数据或测试订单兜底。
   base-url: ${ORDER_SERVICE_BASE_URL}
