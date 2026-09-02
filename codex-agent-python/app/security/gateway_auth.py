@@ -14,10 +14,7 @@ _bearer = HTTPBearer(auto_error=False)
 
 @dataclass(frozen=True, slots=True)
 class GatewayPrincipal:
-    """由可信企业 Gateway 注入并经 Agent Service 验证后的身份上下文。
-
-    `roles` 只能来自已通过服务认证的 Gateway Header，不能来自模型输入或请求 Body。
-    """
+    """由可信企业 Gateway 注入并经 Agent Service 验证后的身份上下文。"""
 
     user_id: str
     tenant_id: str
@@ -68,14 +65,21 @@ def require_gateway_principal(
     )
 
 
+def _require_role(principal: GatewayPrincipal, role: str, message: str) -> GatewayPrincipal:
+    if not principal.has_role(role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=message)
+    return principal
+
+
 def require_approval_principal(
     principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
 ) -> GatewayPrincipal:
-    """要求当前可信用户具有 Agent 高风险操作审批权限。"""
+    return _require_role(principal, "agent.approver", "当前用户没有 Agent 审批权限")
 
-    if not principal.has_role("agent.approver"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="当前用户没有 Agent 审批权限",
-        )
-    return principal
+
+def require_operator_principal(
+    principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
+) -> GatewayPrincipal:
+    """保护 Runtime 快照、手动 Compaction 等运维能力。"""
+
+    return _require_role(principal, "agent.operator", "当前用户没有 Agent Runtime 运维权限")
