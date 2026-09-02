@@ -1,4 +1,5 @@
 import json
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Callable
@@ -21,30 +22,43 @@ class CodexRuntime:
     """官方 OpenAI Codex Python SDK 的企业 Runtime Adapter。
 
     Runtime 只处理 Codex Thread / Turn / Sandbox / Approval / Event / Context 等执行能力。
-    业务 conversation_id、身份和租户属于上层控制面，但 Runtime 负责把可信身份作为
-    MCP HTTP Header 注入 Codex Thread 配置，确保业务身份不进入模型可伪造的 Tool 参数。
+    业务 conversation_id、身份和租户属于上层控制面，但 Runtime 负责：
+
+    - 把可信身份作为 MCP HTTP Header 注入 Thread 配置；
+    - 固定 CODEX_HOME，使 Thread 状态落到持久化卷，而不是容器临时文件系统；
+    - 隔离当前 SDK 仍需使用的私有 Approval Handler 适配。
     """
 
     def __init__(
         self,
         workspace: Path,
+        codex_home: Path,
         order_mcp_url: str,
         order_mcp_service_token: str,
         approval_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
     ) -> None:
         self._workspace = workspace.resolve()
+        self._codex_home = codex_home.resolve()
         self._order_mcp_service_token = order_mcp_service_token
         self._event_mapper = CodexEventMapper()
         self._tracer = get_tracer()
 
+        self._codex_home.mkdir(parents=True, exist_ok=True)
+        if not os.access(self._codex_home, os.W_OK):
+            raise RuntimeError(f"Codex 持久化目录不可写: {self._codex_home}")
+
+        runtime_env = dict(os.environ)
+        runtime_env["CODEX_HOME"] = str(self._codex_home)
+
         config = CodexConfig(
+            env=runtime_env,
             config_overrides=(
                 f"mcp_servers.order.url={json.dumps(order_mcp_url)}",
                 'mcp_servers.order.enabled_tools=["get_order_status","cancel_order"]',
                 'mcp_servers.order.default_tools_approval_mode="approve"',
                 'mcp_servers.order.tools.get_order_status.approval_mode="approve"',
                 'mcp_servers.order.tools.cancel_order.approval_mode="prompt"',
-            )
+            ),
         )
         self._codex = AsyncCodex(config=config)
 
