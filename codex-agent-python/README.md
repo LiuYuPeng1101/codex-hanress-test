@@ -21,6 +21,8 @@ Event / Streaming：实时暴露 Agent 正在做什么
   ↓
 OpenTelemetry：把运行过程送到专业 Observability 平台
   ↓
+Context / Compaction：管理长会话模型上下文
+  ↓
 Java Business System
   ↓
 Business Authorization
@@ -41,7 +43,7 @@ codex-agent-python/
 │   │   └── v1/
 │   │       ├── router.py
 │   │       ├── health.py
-│   │       ├── agent.py             # Thread / Turn / SSE API
+│   │       ├── agent.py             # Thread / Turn / Read / Compact / SSE API
 │   │       └── approval.py          # Approval API
 │   ├── approval/
 │   │   ├── approval_service.py
@@ -119,11 +121,17 @@ Event / Streaming
 OpenTelemetry
 = 如何把运行过程标准化送到专业观测平台
 
+Context
+= 这一轮模型真正拿来工作的上下文
+
+Compaction
+= 当上下文过大时，对会话历史做压缩替换
+
 Business Authorization
 = 当前用户在真实业务上最终有没有权限
 ```
 
-最终安全模型：
+最终关系：
 
 ```text
                          Agent Runtime / Harness
@@ -134,6 +142,10 @@ Business Authorization
    怎么做      能做什么    这次能否做   能碰哪里       做到哪了
       │          │          │           │             │
       └──────────┴──────────┴─────┬─────┴─────────────┘
+                                  ↓
+                         Context / Compaction
+                                  ↓
+                               Model
                                   ↓
                                MCP / I/O
                                   ↓
@@ -150,7 +162,7 @@ Business Authorization
 
 ## 3.1 Thread
 
-Thread 可以理解成一个持续存在的 Agent 会话，不是 Java Thread。
+Thread 是持续存在的 Agent 会话，不是 Java Thread。
 
 ```text
 Thread
@@ -160,7 +172,7 @@ Thread
 └── ...
 ```
 
-同一个 Thread 可以连续运行很多 Turn，并复用上下文。
+同一个 Thread 可以连续运行很多 Turn，并复用会话状态。
 
 创建 Thread：
 
@@ -188,18 +200,20 @@ Turn 是一次完整 Agent 执行：
 POST /api/v1/agents/threads/{thread_id}/turns
 ```
 
-当前非流式实现本质上是：
+当前实现本质上是：
 
 ```python
-result = await thread.run(message, sandbox=Sandbox.read_only)
-return result.final_response
+result = await thread.run(
+    message,
+    sandbox=Sandbox.read_only,
+)
 ```
 
 ---
 
 # 4. Skill：Agent 应该怎么做
 
-当前项目 Skill：
+当前 Skill：
 
 ```text
 .agents/skills/order-analysis/SKILL.md
@@ -303,7 +317,7 @@ approval_handler
 
 当前 Human-in-the-loop 使用：
 
-```python
+```text
 approval_policy = on_request
 approvals_reviewer = ApprovalsReviewer.user
 ```
@@ -319,7 +333,7 @@ approvals_reviewer = ApprovalsReviewer.user
 → 人工 approve / reject
 ```
 
-`cancel_order` 完整链路：
+`cancel_order` 链路：
 
 ```text
 用户要求取消订单
@@ -392,13 +406,16 @@ Event 是结构化运行事实，不等同于普通文本 Log。
 流式链路使用官方 SDK：
 
 ```python
-turn = await thread.turn(message, sandbox=Sandbox.read_only)
+turn = await thread.turn(
+    message,
+    sandbox=Sandbox.read_only,
+)
 
 async for notification in turn.stream():
     ...
 ```
 
-新增 SSE API：
+SSE API：
 
 ```http
 POST /api/v1/agents/threads/{thread_id}/turns/stream
@@ -416,7 +433,7 @@ turn.completed
 
 ## 8.3 为什么不把 Raw Notification 直接给前端
 
-新增 `CodexEventMapper`：
+当前使用 `CodexEventMapper`：
 
 ```text
 Codex Raw Notification
@@ -453,7 +470,7 @@ OTLP
 Langfuse / Phoenix / Tempo / 其他 OTLP Backend
 ```
 
-`.env.example` 中：
+`.env.example`：
 
 ```text
 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=
@@ -465,11 +482,11 @@ OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=
 
 # 9. Sandbox：Runtime 真正的执行边界
 
-Sandbox 回答的问题不是“模型想不想做”，而是：
+Sandbox 回答：
 
 > 即使模型想做、甚至某次 Approval 已经批准，Runtime 实际最多允许它访问和修改哪些本地资源？
 
-官方 Python SDK 提供三个预设：
+官方 Python SDK 提供：
 
 ```python
 Sandbox.read_only
@@ -477,7 +494,7 @@ Sandbox.workspace_write
 Sandbox.full_access
 ```
 
-可以简单理解为：
+简单理解：
 
 ```text
 read_only
@@ -497,8 +514,6 @@ full_access
 
 # 10. Sandbox 与 Approval 的区别
 
-这是 Sandbox 阶段最重要的知识点：
-
 ```text
 Approval
 = 人/策略对某一次动作做逻辑授权
@@ -517,9 +532,7 @@ Sandbox
 → 你的门禁卡实际只允许进入 A 区和 B 区
 ```
 
-即使 Approval 通过，也不代表执行环境没有边界。
-
-因此二者是叠加关系，不是替代关系。
+二者是叠加关系，不是替代关系。
 
 ---
 
@@ -534,16 +547,11 @@ Sandbox
 调用 MCP Tool
 ```
 
-它不需要修改本地源码或创建文件。
-
-所以当前最合理的最小权限是：
+它不需要修改本地源码或创建文件，因此当前显式使用：
 
 ```text
-Order Agent
-→ Sandbox.read_only
+Sandbox.read_only
 ```
-
-当前代码在三处显式固定 Sandbox，而不是依赖 Codex 默认配置。
 
 Thread 创建：
 
@@ -574,9 +582,7 @@ turn = await thread.turn(
 )
 ```
 
-这样不会受机器上 Codex 默认 Sandbox 或历史 Thread 状态影响。
-
-OpenTelemetry Span 中也会记录：
+OpenTelemetry Span 中也记录：
 
 ```text
 agent.sandbox = read-only
@@ -586,17 +592,9 @@ agent.sandbox = read-only
 
 # 12. read_only 为什么仍然可以 cancel_order
 
-这是最容易混淆的一点。
+`Sandbox.read_only` 主要限制 Codex Runtime 的本地执行环境。
 
-`Sandbox.read_only` 主要限制 Codex Runtime 的本地执行环境，例如文件系统。
-
-而：
-
-```text
-cancel_order
-```
-
-走的是：
+`cancel_order` 走的是：
 
 ```text
 Codex Harness
@@ -616,10 +614,8 @@ OrderService
 
 ```text
 本地文件：只读
-真实订单：在审批 + Java 权限校验通过后可以修改
+真实订单：审批 + Java 权限通过后可以修改
 ```
-
-这并不矛盾。
 
 因此：
 
@@ -630,156 +626,395 @@ Sandbox
 ≠ Business Authorization
 ```
 
----
-
-# 13. Sandbox 实验
-
-详细说明见：
+详细实验见：
 
 ```text
 docs/sandbox.md
 ```
 
-## 13.1 读取实验
+---
 
-向订单 Agent 发送：
+# 13. Context：模型这一轮真正拿来工作的内容
+
+这是 Context 阶段最重要的概念：
 
 ```text
-请读取当前 workspace 中 README.md 的第一行，并告诉我内容。不要修改任何文件。
+Thread
+= 整个会话发生过什么
+
+Context
+= 当前这一轮真正送给模型、用于推理的工作集
 ```
 
-预期：读取成功。
-
-## 13.2 写入实验
-
-发送：
+所以：
 
 ```text
-请在当前 workspace 创建 sandbox-test.txt，并写入 hello sandbox。
+Thread 历史很长
+≠
+下一轮一定把全部原始历史 100% 原样送给模型
 ```
 
-预期：写入失败或被 Runtime 拒绝。
+模型的 Context Window 是有限的，因此 Harness 必须管理有效上下文。
 
-这个实验的价值在于验证：
+概念上一次模型调用可能包含：
 
 ```text
-Sandbox 不是 Prompt 中一句“不要修改文件”
-而是 Runtime 的真实执行权限边界
+System / Developer Instructions
+Skill / 当前规则
+压缩后的历史摘要
+最近几轮消息
+必要 Tool Result
+当前用户输入
+```
+
+而不是无限增长的全部原始记录。
+
+---
+
+# 14. Thread History 与 Effective Context 要分开
+
+可以把它类比成数据库：
+
+```text
+conversation_history 表
+→ 保存了 1000 条历史记录
+```
+
+并不意味着每次模型请求都：
+
+```text
+SELECT * FROM conversation_history
+```
+
+然后全部塞给模型。
+
+更合理的是：
+
+```text
+Persistent Thread History
+        ↓
+Context Manager / Harness
+        ↓
+保留 / 裁剪 / Compact
+        ↓
+Effective Context
+        ↓
+Model
+```
+
+因此企业架构中要区分：
+
+```text
+Audit / Persistent History
+≠
+Model Context
+```
+
+完整 Tool Result 可能为了审计长期保存，但模型后续并不需要每轮都看到巨大原始 JSON。
+
+---
+
+# 15. Compaction：长会话怎么继续运行
+
+当 Thread 持续很多轮后，Context Token 会越来越大。
+
+Compaction 的目的不是简单“忘掉旧聊天”，而是：
+
+```text
+旧历史
+ ↓
+提炼关键事实 / 决策 / 当前任务状态
+ ↓
+生成 summary
+ ↓
+构造 compacted / replacement history
+ ↓
+用更短的 Effective Context 继续工作
+```
+
+可以理解成：
+
+```text
+History Replacement
+而不是
+History Forget
+```
+
+例如大量原始历史：
+
+```text
+用户查询订单1001
+Tool 返回 SHIPPED
+继续讨论送达时间
+继续讨论延迟
+继续讨论取消
+...
+```
+
+Compact 后可能保留成：
+
+```text
+此前会话摘要：
+- 当前处理订单1001
+- 已确认状态 SHIPPED
+- 用户讨论过延迟问题
+- 用户考虑取消订单
+- cancel_order 属于需要人工审批的写操作
+```
+
+后续模型依赖摘要 + 最近上下文继续工作。
+
+---
+
+# 16. Context Window 与自动 Compaction
+
+Codex 配置层有两个重要概念：
+
+```text
+model_context_window
+→ 模型上下文窗口大小
+
+model_auto_compact_token_limit
+→ Token 使用达到阈值时触发自动 Compaction
+```
+
+不能等 Context 100% 塞满才压缩，因为还需要为：
+
+```text
+当前用户输入
+Tool Result
+模型生成
+后续推理
+```
+
+留空间。
+
+概念上：
+
+```text
+总 Context Window
+████████████████████
+
+历史增长到阈值
+██████████████░░░░░░
+              ↑
+        Auto Compact
+```
+
+Harness 的价值之一就是让长时间 Agent 不因为历史无限膨胀直接失效。
+
+---
+
+# 17. Compaction 不等于 RAG，也不等于全局 Memory
+
+三者解决的问题完全不同。
+
+```text
+Compaction
+→ 当前 Thread 太长怎么办
+→ 管理 Conversation Context
+
+RAG
+→ 外部大量知识怎么按需检索
+→ 合同库、知识库、客户资料等
+
+Global Memory
+→ 跨 Thread 的长期用户/业务记忆怎么管理
+```
+
+所以：
+
+```text
+Compaction ≠ RAG
+Compaction ≠ Vector DB
+Thread Context ≠ 全局 Memory
 ```
 
 ---
 
-# 14. 不同 Agent 应该有不同 Sandbox
+# 18. Tool Result 为什么容易撑爆 Context
 
-不要为了方便所有 Agent 都开最大权限。
+企业 Tool 很可能一次返回大量内容：
 
 ```text
-OrderAgent
-├── Skill: order-analysis
-├── Tool: get_order_status / cancel_order
-├── Sandbox: read_only
-└── Approval: cancel_order=human
-
-CodingAgent
-├── Skill: java-development
-├── Tool: GitHub / CI
-├── Sandbox: workspace_write
-└── Approval: dangerous action=prompt
-
-FinancialAnalysisAgent
-├── Tool: read-only finance tools
-├── Sandbox: read_only
-└── Business Authorization: finance RBAC
+search_contracts
+→ 几百 KB / 几 MB JSON
 ```
 
-因此以后进入 Agent Gateway / Agent Definition 后，Sandbox 应成为 Agent Definition 的一部分。
+如果每次都把完整 Tool Result 永久带进模型 Context，会快速消耗 Context Window。
 
----
-
-# 15. 当前完整订单执行链
-
-查询订单：
+成熟 Harness 通常会组合：
 
 ```text
-用户
- ↓
-FastAPI
- ↓
-CodexRuntime
- ↓
-Thread / Turn
- ↓
-Sandbox.read_only
- ↓
-order-analysis Skill
- ↓
-get_order_status
- ↓
-MCP
- ↓
-Java Business System
- ↓
-SHIPPED
- ↓
-Event / SSE / Trace
- ↓
-最终回答
+Tool Result Truncation
+Tool Result Eviction
+Compaction
 ```
 
-取消订单：
+因此：
 
 ```text
-用户
- ↓
-Sandbox.read_only（本地仍只读）
- ↓
-Agent 决定调用 cancel_order
- ↓
-approval_mode=prompt
- ↓
-Human Approval
- ↓
-MCP
- ↓
-Java Business Authorization
- ↓
-OrderService.cancelOrder()
- ↓
-Event / SSE / Trace
- ↓
-最终回答
+运行轨迹 / 审计数据
+可以完整保存
+
+模型工作 Context
+应该只保留真正需要的内容
 ```
 
 ---
 
-# 16. 为什么企业 Agent 需要 Harness
+# 19. 当前新增 Thread Read API
 
-如果只有：
+为了观察 Thread 与 Context 的区别，项目新增：
 
-```text
-LLM + Prompt
+```http
+GET /api/v1/agents/threads/{thread_id}
 ```
 
-很难稳定解决：
+内部使用：
 
-```text
-Thread / Turn 生命周期
-Skill 发现
-Tool 调用
-Approval
-Sandbox
-Event / Streaming
-Context / Compaction
-Thread 恢复
-多实例
-Observability
+```python
+thread = await self._codex.thread_resume(thread_id)
+response = await thread.read(include_turns=True)
 ```
 
-Harness / Agent Runtime 就是把这些执行能力组织起来。
+它返回的是 **Thread 快照 / Turn 历史**。
+
+注意：
+
+> 这个接口看到的 Thread 历史，不代表下一轮模型一定会把这些内容全部原样作为 Effective Context。
+
+这正是我们做这个实验的目的。
 
 ---
 
-# 17. 本地 / Codespaces 联调
+# 20. 当前新增 Manual Compact API
+
+新增：
+
+```http
+POST /api/v1/agents/threads/{thread_id}/compact
+```
+
+内部：
+
+```python
+thread = await self._codex.thread_resume(thread_id)
+await thread.compact()
+```
+
+底层对应：
+
+```text
+thread/compact/start
+```
+
+因此 API 返回：
+
+```json
+{
+  "thread_id": "...",
+  "status": "COMPACTION_STARTED"
+}
+```
+
+这里故意不返回 `COMPLETED`，因为官方接口语义是“启动一次 Compaction”，不是我们自己伪造一个同步完成状态。
+
+---
+
+# 21. Context / Compaction 实验
+
+建议使用同一个 Thread 连续执行多轮。
+
+第一轮：
+
+```text
+请记住：这个测试项目代号叫“北极星”，负责人叫小李。
+```
+
+第二轮：
+
+```text
+订单1001是什么状态？
+```
+
+第三轮：
+
+```text
+请再次告诉我项目代号和负责人。
+```
+
+然后读取 Thread：
+
+```http
+GET /api/v1/agents/threads/{thread_id}
+```
+
+再触发：
+
+```http
+POST /api/v1/agents/threads/{thread_id}/compact
+```
+
+之后继续同一个 Thread：
+
+```text
+我们之前约定的项目代号和负责人是什么？
+```
+
+观察关键事实是否继续保留。
+
+这个实验要理解的是：
+
+```text
+Thread 仍然是同一个 Thread
+ ↓
+历史可能发生 Compaction
+ ↓
+模型工作 Context 变短
+ ↓
+关键状态仍应尽量被摘要保留
+```
+
+---
+
+# 22. 当前完整订单 Agent 安全模型
+
+```text
+Order Agent
+│
+├── Skill
+│   └── order-analysis
+│
+├── MCP Tools
+│   ├── get_order_status → auto
+│   └── cancel_order → prompt
+│
+├── Approval
+│   └── Human-in-the-loop
+│
+├── Sandbox
+│   └── read_only
+│
+├── Event / Streaming
+│   └── SSE
+│
+├── Observability
+│   └── OpenTelemetry / OTLP
+│
+├── Context
+│   └── Thread + Effective Context
+│
+├── Compaction
+│   └── Auto + Manual
+│
+└── Java Business System
+    └── Final Authorization
+```
+
+---
+
+# 23. 本地 / Codespaces 联调
 
 Java：
 
@@ -797,12 +1032,21 @@ pip install -e ".[dev]"
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-常用 API：
+Swagger：
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+当前主要 API：
 
 ```text
 POST /api/v1/agents/threads
+GET  /api/v1/agents/threads/{thread_id}
+POST /api/v1/agents/threads/{thread_id}/compact
 POST /api/v1/agents/threads/{thread_id}/turns
 POST /api/v1/agents/threads/{thread_id}/turns/stream
+
 GET  /api/v1/approvals
 POST /api/v1/approvals/{approval_id}/approve
 POST /api/v1/approvals/{approval_id}/reject
@@ -810,7 +1054,7 @@ POST /api/v1/approvals/{approval_id}/reject
 
 ---
 
-# 18. 当前学习进度
+# 24. 当前学习进度
 
 已完成：
 
@@ -841,41 +1085,18 @@ Thread persistence / resume
 
 ---
 
-# 19. 下一阶段：Context / Compaction 要解决什么
-
-同一个 Thread 会不断累积：
+# 25. 最终记忆版
 
 ```text
-用户消息
-Agent 消息
-Tool Call
-Tool Result
-系统 / 开发者指令
-Skill 相关信息
-其他运行上下文
-```
+Thread
+= 会话历史容器
 
-问题是模型上下文窗口不是无限的。
+Context
+= 模型当前工作集
 
-所以接下来要回答：
+Compaction
+= 长会话上下文压缩机制
 
-```text
-Thread 历史和模型 Context 是不是同一个东西？
-一个 Thread 聊很久后发生什么？
-Tool Result 会不会永远原样塞进后续上下文？
-Compaction 到底压缩什么？
-压缩以后 Thread 历史还在不在？
-Compaction 和 RAG / Vector Memory 是不是一回事？
-什么时候自动 compact，什么时候手动 compact？
-```
-
-这就是下一阶段的重点。
-
----
-
-# 20. 最终记忆版
-
-```text
 Skill
 = 怎么做
 
@@ -886,20 +1107,16 @@ Approval
 = 这一次能不能做
 
 Sandbox
-= 实际最多能碰哪里
-
-Business Authorization
-= 当前用户在真实业务上最终有没有权限
+= 本地执行环境最多能碰哪里
 
 Event
-= 发生了什么
-
-Streaming
-= 如何实时传出去
+= Agent 做到哪了
 
 OpenTelemetry
-= 如何送进专业观测平台
+= 如何把运行数据交给专业观测平台
 
-Context / Compaction
-= Thread 变长以后，如何让模型继续有效工作
+Business Authorization
+= 真实业务最终权限边界
 ```
+
+这就是当前项目逐步构建企业 Agent Service 的核心路线。
