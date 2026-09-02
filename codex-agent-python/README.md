@@ -1,10 +1,8 @@
 # Codex Agent Python
 
-这是一个标准的 FastAPI Agent Service 示例，用来演示：
+这是一个基于 **FastAPI + 官方 OpenAI Codex Python SDK + Java/Spring Boot MCP Server** 的企业 Agent 学习项目。
 
-> 已有 Java / Spring Boot 业务系统时，如何使用 Python + FastAPI + 官方 OpenAI Codex Python SDK 开发独立 Agent Service，再通过 MCP 调用 Java 业务能力，并通过 Skill 约束 Agent 行为、通过 Approval 控制高风险操作。
-
-这个项目当前重点不是做一个“聊天机器人”，而是学习一个更接近企业生产环境的 Agent Runtime：
+目标不是做一个简单聊天机器人，而是逐步理解一个生产级 Agent Runtime / Harness 应该具备的核心能力：
 
 ```text
 用户请求
@@ -15,7 +13,11 @@ Skill：告诉 Agent 应该怎么做
   ↓
 MCP Tool：告诉 Agent 能做什么
   ↓
-Approval：决定高风险动作是否允许执行
+Approval：控制高风险动作能不能执行
+  ↓
+Event / Streaming：实时暴露 Agent 正在做什么
+  ↓
+OpenTelemetry：把运行过程送到专业 Observability 平台
   ↓
 Java Business System
   ↓
@@ -24,32 +26,35 @@ Java Business System
 
 ---
 
-## 目录结构
+# 1. 当前项目结构
 
 ```text
 codex-agent-python/
 ├── app/
-│   ├── main.py                  # FastAPI 应用入口
+│   ├── main.py
 │   ├── api/
-│   │   ├── deps.py              # FastAPI Depends 依赖注入
+│   │   ├── deps.py
 │   │   └── v1/
-│   │       ├── router.py        # V1 总路由
-│   │       ├── health.py        # 健康检查
-│   │       ├── agent.py         # Agent HTTP API
-│   │       └── approval.py      # Approval HTTP API
+│   │       ├── router.py
+│   │       ├── health.py
+│   │       ├── agent.py             # Thread / Turn / SSE API
+│   │       └── approval.py          # Approval API
 │   ├── approval/
-│   │   ├── approval_service.py  # Codex Approval 与业务审批 API 的桥接层
-│   │   └── approval_store.py    # 学习用内存 Approval Center
+│   │   ├── approval_service.py
+│   │   └── approval_store.py
 │   ├── core/
-│   │   ├── config.py            # 环境变量 / 配置
-│   │   └── lifespan.py          # 应用启动与关闭生命周期
+│   │   ├── config.py
+│   │   └── lifespan.py
+│   ├── events/
+│   │   ├── models.py                # 稳定的 AgentEvent
+│   │   └── codex_event_mapper.py    # Codex Notification → AgentEvent
+│   ├── observability/
+│   │   └── tracing.py               # OpenTelemetry Trace
 │   ├── runtime/
-│   │   └── codex_runtime.py     # Codex SDK 适配层 + MCP + Approval 配置
+│   │   └── codex_runtime.py         # Codex SDK Adapter
 │   ├── services/
-│   │   └── agent_service.py     # Agent 应用服务
+│   │   └── agent_service.py
 │   └── schemas/
-│       ├── agent.py             # Agent 请求 / 响应模型
-│       └── approval.py          # Approval 请求 / 响应模型
 ├── .agents/
 │   └── skills/
 │       └── order-analysis/
@@ -59,58 +64,10 @@ codex-agent-python/
 ├── tests/
 ├── .env.example
 ├── pyproject.toml
-├── Dockerfile
 └── README.md
 ```
 
----
-
-# 一、当前整体架构
-
-```text
-Web / Business Client
-        |
-        | HTTP
-        v
-FastAPI Agent Service
-        |
-        v
-AgentService
-        |
-        v
-CodexRuntime
-        |
-        v
-官方 openai-codex Python SDK
-        |
-        v
-Codex Runtime / Harness
-        |
-        +---------------- Skill
-        |
-        +---------------- MCP Client
-        |                    |
-        |                    v
-        |            Java Business System
-        |                    |
-        |                    v
-        |               MCP Adapter
-        |                    |
-        |                    v
-        |             Business Service
-        |
-        +---------------- Approval
-                             |
-                             v
-                     ApprovalService
-                             |
-                             v
-                      ApprovalStore
-                             |
-                       人工同意 / 拒绝
-```
-
-Java `hanress-test` 模块扮演已有业务系统，并通过：
+Java `hanress-test` 模块模拟已有业务系统，通过：
 
 ```text
 http://127.0.0.1:8080/mcp
@@ -118,133 +75,197 @@ http://127.0.0.1:8080/mcp
 
 暴露订单 MCP Server。
 
-当前订单 Tool：
+当前 Tool：
 
 ```text
 get_order_status
 → 查询型 Tool
-→ 自动允许执行
+→ 自动执行
 
 cancel_order
 → 写操作 Tool
 → approval_mode = prompt
-→ 必须进入 Approval
+→ 必须人工审批
 ```
 
 ---
 
-# 二、先记住三个核心概念
+# 2. 企业 Agent 的核心心智模型
 
-如果以后忘记整个项目，只需要先记住下面三句话：
+目前已经学过的几个核心概念可以用下面几句话记住：
 
 ```text
+Thread / Turn
+= Agent 的会话与一次完整执行
+
 Skill
-= Agent 应该怎么做
+= Agent 应该怎么做（How）
 
 MCP Tool
-= Agent 能做什么
+= Agent 能做什么（Capability）
 
 Approval
-= Agent 想做高风险动作时，谁决定能不能做
+= 高风险动作能不能做（Control）
+
+Event / Streaming
+= Agent 正在做什么（Runtime Visibility）
+
+OpenTelemetry
+= 如何把运行过程标准化送到专业观测平台
+
+Business Authorization
+= 最终业务安全边界
 ```
 
-三者不是替代关系，而是互相配合。
-
-例如用户说：
+整体关系：
 
 ```text
-“帮我看看订单1001现在什么情况，如果可以的话帮我取消。”
+                        Agent Runtime / Harness
+                                  │
+           ┌──────────────────────┼──────────────────────┐
+           │                      │                      │
+         Skill                  MCP Tool              Approval
+        怎么做                  能做什么              能不能做
+           │                      │                      │
+           └──────────────────────┼──────────────────────┘
+                                  ↓
+                              Event Stream
+                                  ↓
+                       ┌──────────┴──────────┐
+                       │                     │
+                      SSE              OpenTelemetry
+                       │                     │
+                     Browser          Langfuse/Phoenix/
+                                      Tempo 等平台
+                                  ↓
+                          Java Business System
+                                  ↓
+                        Final Authorization
 ```
-
-完整执行可能是：
-
-```text
-用户请求
-   ↓
-Skill 告诉 Agent：
-先识别订单 ID，不要猜实时状态，优先查询真实 Tool
-   ↓
-Agent 调 get_order_status
-   ↓
-MCP → Java
-   ↓
-返回 SHIPPED
-   ↓
-Agent 判断下一步需要 cancel_order
-   ↓
-cancel_order 是写操作，approval_mode=prompt
-   ↓
-产生 Approval
-   ↓
-人工同意
-   ↓
-MCP → Java cancel_order
-   ↓
-订单变为 CANCELLED
-```
-
-这就是 Skill + MCP + Approval 的完整协作方式。
 
 ---
 
-# 三、Skill：Agent 应该怎么做
+# 3. Thread / Turn
 
-## 3.1 Skill 是什么
+## 3.1 Thread
 
-Skill 可以理解成给 Agent 的 SOP、操作规范、领域方法论。
+Thread 可以理解成一个持续存在的 Agent 会话。
 
-它不是 Java / Python 函数，也不是业务 API。
-
-Skill 主要解决：
+它不是 Java Thread。
 
 ```text
-面对某类任务时：
-- 应该先做什么？
-- 哪些信息必须确认？
-- 哪些事情不能猜？
-- 应该优先调用哪些 Tool？
-- 最终答案应该怎样组织？
+Thread
+├── Turn 1
+├── Turn 2
+├── Turn 3
+└── ...
 ```
 
-当前项目 Skill：
+同一个 Thread 可以连续运行很多 Turn，并复用上下文。
+
+创建 Thread：
+
+```http
+POST /api/v1/agents/threads
+```
+
+响应：
+
+```json
+{
+  "thread_id": "thr_xxx"
+}
+```
+
+## 3.2 Turn
+
+Turn 是一次完整 Agent 执行：
+
+```text
+用户输入
+→ 模型判断
+→ Skill
+→ Tool
+→ Approval（如果需要）
+→ Tool Result
+→ 最终回答
+```
+
+普通非流式 API：
+
+```http
+POST /api/v1/agents/threads/{thread_id}/turns
+Content-Type: application/json
+
+{
+  "message": "订单1001现在是什么状态？"
+}
+```
+
+当前非流式实现本质上是：
+
+```python
+result = await thread.run(message)
+return result.final_response
+```
+
+`thread.run()` 是官方 SDK 提供的便利方法，它会把 Turn 启动、事件消费、最终结果收集等过程封装掉。
+
+---
+
+# 4. Skill：Agent 应该怎么做
+
+## 4.1 Skill 是什么
+
+Skill 可以理解成 Agent 的 SOP、领域规范、操作方法论。
+
+当前项目：
 
 ```text
 .agents/skills/order-analysis/SKILL.md
 ```
 
-核心规则包括：
+核心规则：
 
 ```text
 1. 先识别订单 ID
 2. 不允许猜测实时订单状态
-3. 已接入订单 MCP Tool 时优先查询真实业务数据
+3. 已接入 MCP Tool 时优先查询真实业务数据
 4. 区分事实数据和分析结论
-5. 用中文给出明确结果
+5. 最终用中文给出明确结论
 ```
 
-## 3.2 Skill 与 Prompt 的区别
-
-可以简单理解为：
+Skill 主要解决：
 
 ```text
-Prompt
-→ 某次调用或某个 Agent 的具体提示
-
-Skill
-→ 可发现、可复用的任务能力 / SOP
+面对某类任务：
+应该先做什么？
+哪些信息必须确认？
+哪些事情不能猜？
+应该优先用哪个 Tool？
+答案应该怎么组织？
 ```
 
-Skill 更适合沉淀：
+## 4.2 Skill 与 Tool 的区别
 
 ```text
-订单分析规范
-合同审查规范
-退款处理规范
-财务对账规范
-客服升级规则
+Skill = How
+Tool = Action
 ```
 
-## 3.3 Skill 是如何被 Codex 发现的
+错误做法：
+
+```text
+Skill 里写死：订单1001是 SHIPPED
+```
+
+正确做法：
+
+```text
+Skill 要求 Agent 不得猜订单状态，必须调用真实订单 Tool。
+```
+
+## 4.3 Skill 如何被发现
 
 环境变量：
 
@@ -252,9 +273,7 @@ Skill 更适合沉淀：
 AGENT_WORKSPACE=.
 ```
 
-创建 Thread 时，Codex Runtime 会使用 workspace 作为 `cwd`。
-
-当前代码会让 Codex 在：
+创建 Thread 时把 workspace 作为 `cwd`，Codex Harness 会在：
 
 ```text
 <workspace>/.agents/skills
@@ -262,7 +281,7 @@ AGENT_WORKSPACE=.
 
 发现项目级 Skill。
 
-因此这里不是 Java / Python 手动：
+因此不是自己写：
 
 ```text
 registerSkill(...)
@@ -272,46 +291,23 @@ registerSkill(...)
 
 ```text
 Thread cwd
-   ↓
+  ↓
 Codex Harness
-   ↓
+  ↓
 发现 .agents/skills
-   ↓
+  ↓
 读取 Skill metadata / instructions
-   ↓
-根据任务自动选择
-```
-
-## 3.4 Skill 不是什么
-
-Skill 不负责直接查询数据库，也不应该自己偷偷实现业务逻辑。
-
-例如：
-
-```text
-错误：
-Skill 里写死订单1001是 SHIPPED
-
-正确：
-Skill 要求 Agent 不能猜状态，必须调用真实订单 Tool
-```
-
-因此：
-
-```text
-Skill = How
-Tool = Action
+  ↓
+根据用户任务选择 Skill
 ```
 
 ---
 
-# 四、MCP / Tool：Agent 能做什么
+# 5. MCP / Tool：Agent 能做什么
 
-## 4.1 MCP 在这个项目里的角色
+## 5.1 MCP 在本项目中的作用
 
-MCP 可以理解成 Agent Runtime 与外部能力之间的标准连接协议。
-
-当前不是 Python 自己直接：
+Python Agent Service 不直接写：
 
 ```python
 httpx.post("http://java/order/cancel")
@@ -330,7 +326,7 @@ Tool Call
  ↓
 Java MCP Server
  ↓
-Java Business Service
+Business Service
 ```
 
 这样 Harness 可以统一管理：
@@ -345,26 +341,9 @@ Approval
 事件
 ```
 
-## 4.2 当前 Java MCP Tool
+## 5.2 Tool 应该怎么设计
 
-Java 业务系统目前暴露：
-
-```text
-get_order_status(orderId)
-cancel_order(orderId)
-```
-
-建议真实企业项目采用：
-
-```text
-Business Service
-    ↑
-Agent MCP Adapter
-```
-
-而不是把所有 Service 方法全部暴露给 Agent。
-
-更推荐语义明确的 Tool：
+推荐：
 
 ```text
 get_order_status
@@ -374,25 +353,29 @@ create_invoice_draft
 submit_contract_review
 ```
 
-而不是暴露：
+不推荐：
 
 ```text
-updateTable
-executeSql
-genericCrud
+execute_sql
+generic_crud
+update_table
 ```
 
-Tool 的设计应该体现真实业务动作和治理边界。
+原因是企业 Agent 的 Tool 应该表达真实、可治理的业务动作。
 
-## 4.3 CodexRuntime 如何连接 Java MCP
-
-环境变量：
+真实项目更建议：
 
 ```text
-ORDER_MCP_URL=http://127.0.0.1:8080/mcp
+Java Business Service
+        ↑
+Agent MCP Adapter
 ```
 
-当前 `CodexRuntime` 通过 `CodexConfig.config_overrides` 注入：
+MCP Adapter 调原有 Service，而不是把核心 Service 全部直接暴露给 Agent。
+
+## 5.3 当前 MCP 配置
+
+`CodexRuntime` 注入：
 
 ```text
 mcp_servers.order.url=<ORDER_MCP_URL>
@@ -402,144 +385,92 @@ mcp_servers.order.tools.get_order_status.approval_mode="approve"
 mcp_servers.order.tools.cancel_order.approval_mode="prompt"
 ```
 
-其中：
+因此：
 
 ```text
-get_order_status = approve
+get_order_status
+→ approve
+→ 自动执行
+
+cancel_order
+→ prompt
+→ 进入 Approval
 ```
-
-表示查询 Tool 不需要人工审批。
-
-```text
-cancel_order = prompt
-```
-
-表示调用前必须产生 Approval。
-
-## 4.4 Tool 与业务权限不是一回事
-
-即使 Codex 允许执行 Tool，Java 业务系统仍然必须自己检查：
-
-```text
-用户是谁？
-属于哪个 tenant？
-有没有取消订单权限？
-订单是不是属于当前用户？
-订单当前状态还能不能取消？
-金额是否超过阈值？
-```
-
-所以：
-
-```text
-Codex Approval
-≠
-业务系统 Authorization
-```
-
-企业系统中通常两层都需要。
 
 ---
 
-# 五、Approval：高风险动作谁来决定
+# 6. Approval：高风险动作谁来决定
 
-## 5.1 为什么 Agent 特别需要 Approval
-
-传统业务系统通常是：
+Agent 与传统系统最大的区别之一是：
 
 ```text
-用户点击按钮
+传统系统：
+用户点击一个确定按钮
 → Controller
 → Service
 → DB
+
+Agent：
+用户说自然语言
+→ 模型自己判断下一步
+→ 模型决定调用 Tool
+→ Tool 可能修改真实业务
 ```
 
-执行路径比较确定。
+因此写操作不能全部自动执行。
 
-Agent 系统则可能是：
+## 6.1 三个容易混淆的概念
 
 ```text
-用户说一句自然语言
-→ Agent 自己判断下一步
-→ Agent 决定调用 Tool
-→ Tool 修改真实业务数据
+approval_policy
+→ 是否允许产生审批请求 / 什么情况下需要审批
+
+approvals_reviewer
+→ 审批发生后交给谁判断
+
+approval_handler
+→ 宿主应用具体怎么接住审批请求
 ```
 
-中间出现了模型自主决策，因此企业一般不能让所有写操作直接执行。
+## 6.2 ApprovalMode.auto_review
 
-所以需要：
-
-```text
-Permission / Policy
-Approval
-Business Authorization
-Audit
-Sandbox
-```
-
-## 5.2 Approval 相关的三个概念
-
-这是当前代码最重要的知识点之一：
-
-```text
-1. approval_policy
-   → 是否允许产生审批请求 / 什么情况下需要审批
-
-2. approvals_reviewer
-   → 审批发生以后交给谁审
-
-3. approval_handler
-   → 如果交给用户审，宿主程序具体怎么接住审批请求
-```
-
-不要把它们理解成同一个东西。
-
----
-
-# 六、ApprovalMode 与 ApprovalsReviewer.user
-
-官方 Python 高层 SDK 当前主要暴露：
+当前 Python 高层 SDK 主要暴露：
 
 ```python
 ApprovalMode.deny_all
 ApprovalMode.auto_review
 ```
 
-其中：
-
-```text
-ApprovalMode.auto_review
-```
-
-大致会映射为：
+`auto_review` 可以理解成：
 
 ```text
 approval_policy = on-request
 approvals_reviewer = auto_review
 ```
 
-含义是：
+也就是：
 
 ```text
-需要审批时
-→ 可以产生审批
-→ 交给 Codex 自动 reviewer 判断
+需要审批
+→ Codex 自动 reviewer 判断
 ```
 
-但企业 Human-in-the-loop 需要的是：
+## 6.3 ApprovalsReviewer.user
+
+企业 Human-in-the-loop 需要：
 
 ```text
-需要审批时
-→ 交给真实用户 / 管理员
+需要审批
+→ 真实员工 / 管理员决定
 ```
 
-底层协议已经支持：
+底层协议支持：
 
 ```python
 ApprovalsReviewer.user
 ```
 
-因此当前项目创建 Thread 时使用：
+当前 Thread 创建使用：
 
 ```python
 params = ThreadStartParams(
@@ -551,103 +482,567 @@ params = ThreadStartParams(
 )
 ```
 
-可以理解成：
+这里的 `user` 更准确理解为：
 
 ```text
-approval_policy = on_request
-→ 允许需要审批的动作提出 Approval
-
-approvals_reviewer = user
-→ Approval 不交给自动 reviewer
-→ 交回宿主应用处理
+把审批交还给 App Server Client / 宿主应用处理
 ```
 
-这里的 `user` 不是指 OpenAI 自动弹出某个网页。
+当前宿主应用就是 FastAPI Agent Service。
 
-更准确地说是：
+## 6.4 approval_handler
 
-```text
-把审批交给 App Server Client / 宿主应用
-```
-
-在当前项目中，宿主应用就是：
-
-```text
-FastAPI Agent Service
-```
-
----
-
-# 七、approval_handler 是什么
-
-`ApprovalsReviewer.user` 只表示：
-
-```text
-这个审批由用户侧处理
-```
-
-但 Python 程序还需要一个入口真正接住 App Server 发来的 Server Request。
-
-这就是：
-
-```text
-approval_handler
-```
-
-当前 `lifespan.py` 创建：
-
-```text
-ApprovalStore
-   ↓
-ApprovalService
-   ↓
-CodexRuntime
-```
-
-并把：
+`lifespan.py` 把：
 
 ```python
 approval_service.handle_codex_request
 ```
 
-传给 `CodexRuntime`。
+交给 `CodexRuntime`。
 
-当前官方 `AsyncCodex` 高层构造器暂时没有直接暴露 `approval_handler`，所以 Runtime 内部做了一层 SDK Adapter：
+当前官方 `AsyncCodex` 高层构造器还没有直接暴露 `approval_handler`，所以 Runtime Adapter 内部暂时使用：
 
 ```python
 self._codex._client._sync._approval_handler = approval_handler
 ```
 
-这属于内部 SDK 适配代码，因此只放在：
+因为这是 SDK 私有字段，所以必须限制在 `CodexRuntime` 内，不应该让 Controller / Service 到处依赖。
+
+## 6.5 cancel_order 完整 Human-in-the-loop
 
 ```text
-app/runtime/codex_runtime.py
+用户：取消订单1001
+ ↓
+Agent 决定调用 cancel_order
+ ↓
+approval_mode = prompt
+ ↓
+产生 MCP Tool Approval
+ ↓
+approvals_reviewer = user
+ ↓
+mcpServer/elicitation/request
+ ↓
+approval_handler
+ ↓
+ApprovalService
+ ↓
+ApprovalStore.create()
+ ↓
+PENDING
+ ↓
+等待人工
+   ┌───────┴───────┐
+   │               │
+approve           reject
+   │               │
+accept           decline
+   │               │
+   └───────┬───────┘
+           ↓
+         Codex
+           ↓
+是否真正执行 cancel_order
 ```
 
-业务 API / Service 不直接依赖这些私有字段。
+批准 API：
 
-未来如果官方 SDK 直接支持：
-
-```python
-AsyncCodex(
-    config=config,
-    approval_handler=approval_handler,
-)
+```http
+POST /api/v1/approvals/{approval_id}/approve
 ```
 
-只需要修改 `CodexRuntime`，其他业务代码不用改。
+拒绝 API：
+
+```http
+POST /api/v1/approvals/{approval_id}/reject
+```
+
+当前 `ApprovalStore` 是学习用内存实现。生产环境应演进为 DB / Redis + Approval Center。
 
 ---
 
-# 八、一次 cancel_order Approval 的完整流程
+# 7. Codex Approval 不等于业务权限
 
-用户：
+即使 Codex Approval 已经批准，Java Business System 仍然必须独立检查：
 
 ```text
-“取消订单1001”
+userId
+角色
+tenantId
+订单归属
+订单状态
+金额阈值
+业务规则
 ```
 
-完整链路：
+所以：
+
+```text
+Codex Approval
+≠
+Business Authorization
+```
+
+企业安全通常至少需要：
+
+```text
+Agent Policy
++ Approval
++ Sandbox
++ Business Authorization
++ Audit
+```
+
+---
+
+# 8. Event：Agent 运行过程中发生了什么
+
+完成 Skill / MCP / Approval 后，新的问题是：
+
+> Agent 这一轮执行过程中到底发生了什么？
+
+App Server 本身就是事件驱动的。
+
+一个 Turn 可以出现：
+
+```text
+turn/started
+ ↓
+item/started
+ ↓
+Tool / Message / 其他 Item
+ ↓
+item/completed
+ ↓
+item/agentMessage/delta
+ ↓
+turn/completed
+```
+
+## 8.1 Event 与 Log 的区别
+
+Log：
+
+```text
+给开发人员阅读的文本日志
+```
+
+例如：
+
+```text
+订单查询成功
+```
+
+Event：
+
+```json
+{
+  "type": "tool.completed",
+  "thread_id": "t001",
+  "turn_id": "r001",
+  "tool_name": "get_order_status"
+}
+```
+
+是结构化数据，可以被：
+
+```text
+前端
+Trace 系统
+监控系统
+审计系统
+指标系统
+```
+
+消费。
+
+## 8.2 Item 是什么
+
+Thread / Turn / Item 的关系：
+
+```text
+Thread
+├── Turn 1
+│   ├── User Message
+│   ├── MCP Tool Call
+│   └── Agent Message
+└── Turn 2
+    ├── User Message
+    ├── Approval
+    ├── MCP Tool Call
+    └── Agent Message
+```
+
+因此：
+
+```text
+item/started
+```
+
+表示 Turn 内的某个 Item 开始，而不是整个 Agent 开始。
+
+---
+
+# 9. Streaming：实时看到 Agent 执行过程
+
+非流式：
+
+```text
+用户请求
+ ↓
+等待 10 秒
+ ↓
+一次性得到最终 answer
+```
+
+流式：
+
+```text
+turn.started
+ ↓
+tool.started
+ ↓
+tool.completed
+ ↓
+message.delta
+ ↓
+message.delta
+ ↓
+turn.completed
+```
+
+## 9.1 Delta 是什么
+
+最终答案：
+
+```text
+订单1001已经发货。
+```
+
+可能分成：
+
+```text
+delta1 = "订单"
+delta2 = "1001"
+delta3 = "已经发货"
+delta4 = "。"
+```
+
+Client 持续拼接后得到最终文本。
+
+## 9.2 官方 Python SDK 的正确用法
+
+原来：
+
+```python
+result = await thread.run(message)
+```
+
+适合只关心最终结果。
+
+现在流式链路使用官方公开接口：
+
+```python
+turn = await thread.turn(message)
+
+async for notification in turn.stream():
+    ...
+```
+
+这里的 `turn` 是 `AsyncTurnHandle`。
+
+官方 SDK 会按 `turn_id` 路由 Notification，因此一个 `AsyncCodex` 可以同时承载多个活跃 Turn，而不需要我们自己写 stdout Reader Loop。
+
+---
+
+# 10. 为什么不把 Codex Raw Notification 直接给前端
+
+当前新增：
+
+```text
+CodexEventMapper
+```
+
+流程：
+
+```text
+Codex Raw Notification
+        ↓
+CodexEventMapper
+        ↓
+安全、稳定的 AgentEvent
+        ↓
+SSE / OpenTelemetry
+```
+
+前端只允许看到适合产品展示的事件，例如：
+
+```text
+turn.started
+turn.completed
+tool.started
+tool.completed
+item.started
+item.completed
+message.delta
+```
+
+不直接透传：
+
+```text
+reasoning 事件
+完整 Tool arguments
+完整 Tool result
+文件内容
+其他可能包含敏感信息的底层事件
+```
+
+原因有两个：
+
+```text
+1. 前端不应该依赖 Codex 私有协议细节
+2. 企业 Tool 参数和结果可能包含敏感数据
+```
+
+所以 `AgentEvent` 是我们自己的稳定协议。
+
+---
+
+# 11. SSE：把 Agent Event 推给浏览器
+
+新增流式 API：
+
+```http
+POST /api/v1/agents/threads/{thread_id}/turns/stream
+Content-Type: application/json
+
+{
+  "message": "订单1001现在是什么状态？"
+}
+```
+
+返回 `text/event-stream`。
+
+示意：
+
+```text
+event: turn.started
+data: {...}
+
+event: tool.started
+data: {"tool_name":"get_order_status"}
+
+event: tool.completed
+data: {...}
+
+event: message.delta
+data: {"delta":"订单"}
+
+event: message.delta
+data: {"delta":"1001"}
+
+event: turn.completed
+data: {...}
+```
+
+## 11.1 为什么当前优先 SSE，而不是 WebSocket
+
+当前 Agent 对话主要是：
+
+```text
+Browser
+→ HTTP 发送一次请求
+
+Server
+→ 持续推送运行过程
+```
+
+核心数据方向是 Server → Browser，因此 SSE 简单且合适。
+
+以后如果需要：
+
+```text
+实时语音
+高频双向交互
+Turn Steer
+远程协同控制
+```
+
+再考虑 WebSocket。
+
+---
+
+# 12. Observability：不要自己造平台
+
+Observability 不是简单打印日志。
+
+企业真正需要知道：
+
+```text
+某个 Turn 总耗时多久？
+哪个 Tool 最慢？
+Tool 失败率多少？
+Approval 等了多久？
+哪些 Agent 经常失败？
+哪些 Session 成本最高？
+某个生产故障经过了哪些步骤？
+```
+
+这些能力已经有成熟平台。
+
+例如：
+
+```text
+Langfuse
+Arize Phoenix
+Grafana Tempo
+以及其他支持 OpenTelemetry / OTLP 的后端
+```
+
+因此本项目原则是：
+
+```text
+不自研 Trace UI
+不自研 Timeline Dashboard
+不自研查询平台
+
+Agent Service 只负责产生标准 Telemetry
+```
+
+---
+
+# 13. OpenTelemetry：把 Runtime 与观测平台解耦
+
+当前新增：
+
+```text
+app/observability/tracing.py
+```
+
+`CodexRuntime` 为 Turn 创建 Span，例如：
+
+```text
+agent.turn
+agent.turn.stream
+```
+
+并记录：
+
+```text
+agent.thread.id
+agent.turn.id
+agent.streaming
+agent.turn.status
+agent.turn.duration_ms
+```
+
+流式过程中还可以把：
+
+```text
+turn.started
+tool.started
+tool.completed
+message.delta
+turn.completed
+```
+
+加入 Span Event。
+
+## 13.1 为什么选择 OpenTelemetry
+
+如果直接在业务代码里写：
+
+```python
+langfuse.xxx(...)
+```
+
+那么 Agent Runtime 会直接依赖某个 Vendor。
+
+现在：
+
+```text
+CodexRuntime
+ ↓
+OpenTelemetry
+ ↓
+OTLP
+ ↓
+Langfuse / Phoenix / Tempo / ...
+```
+
+以后换平台，Agent 核心代码基本不用改。
+
+## 13.2 OTLP 配置
+
+`.env.example`：
+
+```text
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=
+```
+
+留空：
+
+```text
+不发送远程 Trace
+本地仍正常运行
+```
+
+配置后：
+
+```text
+Agent Service
+→ OTLP
+→ Observability Backend
+```
+
+部分平台还需要：
+
+```text
+OTEL_EXPORTER_OTLP_HEADERS=...
+```
+
+真实密钥不要提交到 Git。
+
+---
+
+# 14. Event / Streaming / Observability 三者的区别
+
+这是本阶段最重要的一组概念：
+
+```text
+Event
+= Agent 运行过程中发生了一件什么事
+
+Streaming
+= 如何把这些 Event / Delta 实时传出去
+
+Observability
+= 如何把运行数据记录、关联、查询、分析和告警
+```
+
+例如：
+
+```text
+Codex 产生：tool.started
+        ↓
+这是 Event
+        ↓
+通过 SSE 推到浏览器
+        ↓
+这是 Streaming
+        ↓
+同时记录到 OpenTelemetry Trace
+        ↓
+在 Langfuse / Phoenix / Tempo 里查询
+        ↓
+这是 Observability
+```
+
+---
+
+# 15. 当前完整执行链
+
+查询订单：
 
 ```text
 用户
@@ -660,232 +1055,103 @@ CodexRuntime
  ↓
 Thread / Turn
  ↓
-Codex Harness
+order-analysis Skill
  ↓
-模型决定调用 cancel_order
+Agent 决定调用 get_order_status
  ↓
-cancel_order approval_mode=prompt
+tool.started Event
  ↓
-需要审批
+MCP
  ↓
-Thread approval_policy=on_request
- ↓
-允许发起 Approval
- ↓
-approvals_reviewer=user
- ↓
-App Server 向 Client 发送 Server Request
- ↓
-mcpServer/elicitation/request
- ↓
-approval_handler
- ↓
-ApprovalService.handle_codex_request()
- ↓
-确认 codex_approval_kind=mcp_tool_call
- ↓
-ApprovalStore.create()
- ↓
-status=PENDING
- ↓
-等待人工决定
-```
-
-当前 `ApprovalStore` 使用 `threading.Event`：
-
-```text
-Codex SDK reader thread
-→ wait_for_decision()
-→ 暂停等待
-```
-
-FastAPI 自己的 event loop 没有被阻塞，所以仍然可以访问：
-
-```http
-GET /api/v1/approvals
-```
-
-查看待审批记录。
-
-批准：
-
-```http
-POST /api/v1/approvals/{approval_id}/approve
-```
-
-拒绝：
-
-```http
-POST /api/v1/approvals/{approval_id}/reject
-```
-
-批准以后：
-
-```text
-ApprovalStore
-PENDING → APPROVED
- ↓
-threading.Event.set()
- ↓
-唤醒 approval_handler
- ↓
-返回：
-{"action":"accept","content":{}}
- ↓
-Codex Harness
- ↓
-真正执行 cancel_order
- ↓
-Java MCP
+Java Business System
  ↓
 OrderService
+ ↓
+SHIPPED
+ ↓
+tool.completed Event
+ ↓
+message.delta × N
+ ↓
+turn.completed
 ```
 
-拒绝则返回：
-
-```json
-{
-  "action": "decline",
-  "content": null
-}
-```
-
-于是 Tool 不会执行。
-
----
-
-# 九、Skill + MCP + Approval 的关系
-
-可以用下面这张图统一理解：
+取消订单：
 
 ```text
-                 用户任务
-                    ↓
-               Codex Harness
-                    ↓
-        ┌──────── Skill ────────┐
-        │  告诉 Agent 怎么做     │
-        └──────────┬────────────┘
-                   ↓
-            Agent 决定下一步
-                   ↓
-        ┌──────── MCP Tool ─────┐
-        │   告诉 Agent 能做什么  │
-        └──────────┬────────────┘
-                   ↓
-          Tool 是否需要审批？
-             ┌─────┴─────┐
-             │           │
-            否           是
-             │           │
-             │       Approval
-             │       人工决策
-             │           │
-             └─────┬─────┘
-                   ↓
-              Java Business
-                   ↓
-              Business Service
-```
-
-一句话记忆：
-
-```text
-Skill = How
-MCP Tool = Capability
-Approval = Control
-Business Authorization = Final business security boundary
+用户
+ ↓
+Skill
+ ↓
+Agent 决定调用 cancel_order
+ ↓
+Tool 配置 prompt
+ ↓
+Approval PENDING
+ ↓
+人工 approve / reject
+ ↓
+如果 approve：
+MCP → Java → cancel_order
+ ↓
+Event / SSE / Trace
+ ↓
+最终回答
 ```
 
 ---
 
-# 十、Thread / Turn
+# 16. 为什么企业 Agent 需要 Harness
 
-Thread 可以理解成一个持续存在的 Agent 会话。
+到现在已经可以看清 Harness 的价值。
 
-Turn 是 Thread 中的一轮完整执行：
+如果只是：
 
 ```text
-用户输入
-→ 模型推理
-→ Skill
-→ Tool
-→ Approval
-→ Tool Result
-→ 最终回答
+LLM + Prompt
 ```
 
-创建 Thread：
+很难稳定解决：
 
-```http
-POST /api/v1/agents/threads
+```text
+会话生命周期
+Tool 调用
+Skill 发现
+高风险审批
+运行时事件
+流式输出
+Sandbox
+上下文压缩
+多实例恢复
+可观测性
 ```
 
-响应：
+Harness / Agent Runtime 负责把这些能力组织起来。
 
-```json
-{
-  "thread_id": "thr_xxx"
-}
+业务开发者重点开发：
+
+```text
+Agent Definition
+Prompt / Instructions
+Skills
+MCP Tools
+Policy
+Business Authorization
+Evals
 ```
-
-执行 Turn：
-
-```http
-POST /api/v1/agents/threads/{thread_id}/turns
-Content-Type: application/json
-
-{
-  "message": "订单1001现在是什么状态？"
-}
-```
-
-同一个 Thread 可以连续运行很多 Turn，并复用上下文。
 
 ---
 
-# 十一、为什么使用 AsyncCodex
+# 17. 本地 / Codespaces 联调
 
-FastAPI 是异步 Web 框架，因此当前使用官方 SDK 的 `AsyncCodex`。
-
-FastAPI 启动时创建一份 Runtime：
-
-```text
-FastAPI startup
-      ↓
-ApprovalStore / ApprovalService
-      ↓
-CodexRuntime
-      ↓
-AsyncCodex start
-      ↓
-整个应用生命周期复用
-      ↓
-FastAPI shutdown
-      ↓
-AsyncCodex close
-```
-
-不是每个 HTTP 请求重新启动 Codex Runtime。
-
----
-
-# 十二、本地 / Codespaces 联调
-
-先启动 Java：
+Java：
 
 ```bash
 cd hanress-test
 mvn spring-boot:run
 ```
 
-MCP 地址：
-
-```text
-http://127.0.0.1:8080/mcp
-```
-
-再启动 Python：
+Python：
 
 ```bash
 cd codex-agent-python
@@ -902,31 +1168,19 @@ Swagger：
 http://127.0.0.1:8000/docs
 ```
 
-查询测试：
+测试建议：
 
 ```text
 1. POST /api/v1/agents/threads
 2. 保存 thread_id
-3. POST /api/v1/agents/threads/{thread_id}/turns
-4. 输入：请查询订单1001的真实状态
-```
-
-Approval 测试：
-
-```text
-1. 在 Turn 中输入：请取消订单1001
-2. 原 Turn 会等待 Approval
-3. GET /api/v1/approvals
-4. 找到 PENDING approval_id
-5. POST /api/v1/approvals/{approval_id}/approve
-   或
-   POST /api/v1/approvals/{approval_id}/reject
-6. 原 Turn 继续执行并返回最终结果
+3. 普通调用：POST /threads/{thread_id}/turns
+4. 流式调用：POST /threads/{thread_id}/turns/stream
+5. 写操作时配合 /api/v1/approvals API 完成审批
 ```
 
 ---
 
-# 十三、与 Spring Boot 的对应关系
+# 18. 与 Spring Boot 的对应关系
 
 ```text
 Spring Boot                 FastAPI
@@ -940,7 +1194,7 @@ Bean 注入             ->    Depends
 启动/销毁生命周期     ->    lifespan
 ```
 
-当前 Runtime 分层可以理解为：
+Runtime 分层：
 
 ```text
 Controller / API
@@ -950,95 +1204,48 @@ AgentService
 CodexRuntime Adapter
     ↓
 Official Codex SDK
+    ↓
+Codex Harness
 ```
 
-这样未来即使替换 Agent Runtime，也不需要让业务层直接依赖 Codex 私有实现。
+Vendor Observability：
+
+```text
+CodexRuntime
+    ↓
+OpenTelemetry
+    ↓
+OTLP Backend
+```
+
+这样业务层不直接依赖 Codex 私有实现，也不直接绑定某个 Observability 平台。
 
 ---
 
-# 十四、当前 Approval 实现为什么只是学习版
+# 19. 当前学习进度
 
-当前：
-
-```text
-ApprovalStore = 内存
-```
-
-适合学习：
-
-```text
-Turn 暂停
-→ PENDING
-→ approve / reject
-→ Turn 恢复
-```
-
-但生产环境不能只使用内存，因为：
-
-```text
-Agent Service 重启会丢数据
-多个实例无法共享审批状态
-无法做完整审计
-无法支持超时、转交、审批人、组织权限
-```
-
-生产版本通常演进成：
-
-```text
-Approval Center
-├── DB / Redis
-├── approval_request
-├── applicant
-├── approver
-├── tenant_id
-├── risk_level
-├── tool_name
-├── tool_arguments
-├── PENDING / APPROVED / REJECTED / EXPIRED
-├── timeout
-├── audit log
-└── message / event notification
-```
-
-而 Java 业务系统仍然保留最终 RBAC / ABAC / Tenant / Business Rule 校验。
-
----
-
-# 十五、当前学习进度
-
-已经完成：
+已完成：
 
 ```text
 Thread / Turn                 ✅
 Skill                         ✅
 MCP / Tool                    ✅
 Approval / Human-in-the-loop  ✅
+Event                         ✅
+Streaming / SSE               ✅
+OpenTelemetry Observability   ✅
 ```
 
-下一阶段：
+当前阶段：
 
 ```text
-Event / Streaming / Observability
+Sandbox                       ← 进行中
 ```
 
-目标是能够看到 Agent 一轮 Turn 内真正发生了什么：
+后续：
 
 ```text
-turn started
-skill used
-tool started
-approval requested
-approval resolved
-tool completed
-agent message delta
-turn completed
-```
-
-再往后继续：
-
-```text
-Sandbox
-→ Context / Compaction
+Context / Compaction
 → Thread persistence / resume
 → 多实例
 → Agent Gateway
@@ -1046,31 +1253,30 @@ Sandbox
 
 ---
 
-# 十六、最后的核心心智模型
+# 20. 最终记忆版
 
-不要把企业 Agent 理解成：
-
-```text
-LLM + Prompt
-```
-
-更准确的理解是：
+如果以后忘记细节，只记住这张图：
 
 ```text
-                  Agent Runtime / Harness
-                           │
-          ┌────────────────┼────────────────┐
-          │                │                │
-        Skill             Tool           Approval
-      怎么做             能做什么          能不能做
-          │                │                │
-          └────────────────┼────────────────┘
-                           ↓
-                    Business System
-                           ↓
-                  Final Authorization
-                           ↓
-                     Real Business
+                         Agent Runtime / Harness
+                                  │
+      ┌───────────┬───────────────┼───────────────┬───────────────┐
+      │           │               │               │               │
+    Skill       MCP Tool       Approval         Event          Sandbox
+   怎么做       能做什么        能不能做        做到哪了        能碰哪里
+      │           │               │               │               │
+      └───────────┴───────────────┼───────────────┴───────────────┘
+                                  ↓
+                           Business System
+                                  ↓
+                         Final Authorization
+                                  ↓
+                           Real Business
+
+Event
+ ↓
+├── SSE → Browser
+└── OpenTelemetry → Langfuse / Phoenix / Tempo
 ```
 
-这也是当前项目继续演进成企业级 Agent Service 的基础。
+这就是当前项目逐步构建企业 Agent Service 的核心路线。
