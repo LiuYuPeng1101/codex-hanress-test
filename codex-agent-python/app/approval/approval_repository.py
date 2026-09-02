@@ -27,6 +27,9 @@ class ApprovalRequest:
     """持久化审批记录的领域对象。"""
 
     id: str
+    conversation_id: str
+    requester_user_id: str
+    tenant_id: str
     method: str
     thread_id: str | None
     turn_id: str | None
@@ -37,7 +40,6 @@ class ApprovalRequest:
     decided_at: datetime | None
     decision: str | None
     decided_by: str | None
-    decided_tenant_id: str | None
 
 
 class ApprovalTimeoutError(TimeoutError):
@@ -50,6 +52,9 @@ approval_requests = Table(
     "approval_requests",
     metadata,
     Column("id", String(36), primary_key=True),
+    Column("conversation_id", String(36), nullable=False),
+    Column("requester_user_id", String(128), nullable=False),
+    Column("tenant_id", String(128), nullable=False),
     Column("method", String(128), nullable=False),
     Column("thread_id", String(128), nullable=True),
     Column("turn_id", String(128), nullable=True),
@@ -58,26 +63,19 @@ approval_requests = Table(
     Column("status", String(32), nullable=False),
     Column("decision", String(32), nullable=True),
     Column("decided_by", String(128), nullable=True),
-    Column("decided_tenant_id", String(128), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("decided_at", DateTime(timezone=True), nullable=True),
 )
 
 
 class ApprovalRepository:
-    """基于 PostgreSQL 的审批仓储。
-
-    仓储不在应用启动时自动建表。生产环境应通过数据库迁移先创建表，应用只验证连接和使用数据。
-    决策更新带 `status=PENDING` 条件，保证多个 Agent Service 实例同时处理时只有一个实例能成功落库。
-    """
+    """基于 PostgreSQL 的多租户审批仓储。"""
 
     def __init__(self, database_url: str, poll_interval_seconds: float = 0.5) -> None:
         self._engine: Engine = create_engine(database_url, pool_pre_ping=True)
         self._poll_interval_seconds = poll_interval_seconds
 
     def healthcheck(self) -> None:
-        """验证数据库连接以及审批表是否已经完成迁移。"""
-
         with self._engine.connect() as conn:
             conn.execute(text("SELECT 1"))
             conn.execute(text("SELECT id FROM approval_requests LIMIT 1"))
@@ -85,10 +83,21 @@ class ApprovalRepository:
     def close(self) -> None:
         self._engine.dispose()
 
-    def create(self, method: str, params: dict[str, Any]) -> ApprovalRequest:
+    def create(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        conversation_id: str,
+        requester_user_id: str,
+        tenant_id: str,
+    ) -> ApprovalRequest:
         now = datetime.now(timezone.utc)
         item = ApprovalRequest(
             id=str(uuid.uuid4()),
+            conversation_id=conversation_id,
+            requester_user_id=requester_user_id,
+            tenant_id=tenant_id,
             method=method,
             thread_id=self._optional_text(params, "threadId", "thread_id"),
             turn_id=self._optional_text(params, "turnId", "turn_id"),
@@ -99,12 +108,14 @@ class ApprovalRepository:
             decided_at=None,
             decision=None,
             decided_by=None,
-            decided_tenant_id=None,
         )
         with self._engine.begin() as conn:
             conn.execute(
                 insert(approval_requests).values(
                     id=item.id,
+                    conversation_id=item.conversation_id,
+                    requester_user_id=item.requester_user_id,
+                    tenant_id=item.tenant_id,
                     method=item.method,
                     thread_id=item.thread_id,
                     turn_id=item.turn_id,
@@ -116,8 +127,13 @@ class ApprovalRepository:
             )
         return item
 
-    def list_all(self, limit: int = 100) -> list[ApprovalRequest]:
-        stmt = select(approval_requests).order_by(approval_requests.c.created_at.desc()).limit(limit)
+    def list_for_tenant(self, tenant_id: str, limit: int = 100) -> list[ApprovalRequest]:
+        stmt = (
+            select(approval_requests)
+            .where(approval_requests.c.tenant_id == tenant_id)
+            .order_by(approval_requests.c.created_at.desc())
+            .limit(limit)
+        )
         with self._engine.connect() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [self._from_row(row) for row in rows]
@@ -136,7 +152,7 @@ class ApprovalRepository:
         decision: str,
         *,
         decided_by: str,
-        decided_tenant_id: str,
+        tenant_id: str,
     ) -> ApprovalRequest:
         if decision not in {"approve", "reject"}:
             raise ValueError("decision 只能是 approve 或 reject")
@@ -147,13 +163,13 @@ class ApprovalRepository:
             update(approval_requests)
             .where(
                 approval_requests.c.id == approval_id,
+                approval_requests.c.tenant_id == tenant_id,
                 approval_requests.c.status == "PENDING",
             )
             .values(
                 status=new_status,
                 decision=decision,
                 decided_by=decided_by,
-                decided_tenant_id=decided_tenant_id,
                 decided_at=now,
             )
         )
@@ -162,19 +178,14 @@ class ApprovalRepository:
 
         if result.rowcount == 0:
             existing = self.get(approval_id)
+            if existing.tenant_id != tenant_id:
+                raise KeyError(approval_id)
             if existing.status != "PENDING":
                 raise ValueError("该审批已经处理，不能重复审批")
             raise RuntimeError("审批状态更新失败")
         return self.get(approval_id)
 
     def wait_for_decision(self, approval_id: str, timeout_seconds: int) -> str:
-        """等待跨实例可见的人工决策。
-
-        当前使用数据库轮询，是为了保持 Codex 同步 approval handler 的协议语义，同时避免进程内 Event。
-        后续在高吞吐部署中可以把唤醒机制替换为 PostgreSQL LISTEN/NOTIFY、Redis Pub/Sub 或消息队列，
-        但审批记录本身仍应由持久化存储作为事实来源。
-        """
-
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             item = self.get(approval_id)
@@ -214,6 +225,9 @@ class ApprovalRepository:
     def _from_row(row: Any) -> ApprovalRequest:
         return ApprovalRequest(
             id=row["id"],
+            conversation_id=row["conversation_id"],
+            requester_user_id=row["requester_user_id"],
+            tenant_id=row["tenant_id"],
             method=row["method"],
             thread_id=row["thread_id"],
             turn_id=row["turn_id"],
@@ -224,5 +238,4 @@ class ApprovalRepository:
             decided_at=row["decided_at"],
             decision=row["decision"],
             decided_by=row["decided_by"],
-            decided_tenant_id=row["decided_tenant_id"],
         )
