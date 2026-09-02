@@ -1,6 +1,7 @@
 package com.example.hanresstest.gateway;
 
 import com.example.hanresstest.config.OrderServiceProperties;
+import com.example.hanresstest.security.BusinessIdentity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
@@ -9,7 +10,8 @@ import tools.jackson.databind.JsonNode;
 /**
  * 通过企业内部 HTTP API 访问真实订单系统。
  *
- * <p>这里不包含任何测试订单或内存状态。上游 API 不可用时直接抛出异常，由调用链和观测系统处理。</p>
+ * <p>服务凭据用于系统间认证；X-User-Id / X-Tenant-Id / X-Roles 表达当前业务主体。
+ * 最终订单系统必须基于这些可信身份独立执行 RBAC / ABAC / Tenant / 资源归属和状态校验。</p>
  */
 @Component
 public class HttpOrderGateway implements OrderGateway {
@@ -26,18 +28,26 @@ public class HttpOrderGateway implements OrderGateway {
     }
 
     @Override
-    public JsonNode getOrderStatus(String orderId) {
+    public JsonNode getOrderStatus(String orderId, BusinessIdentity identity) {
         return restClient.get()
                 .uri(properties.statusPath(), orderId)
+                .headers(headers -> applyIdentity(headers, identity))
                 .retrieve()
                 .body(JsonNode.class);
     }
 
     @Override
-    public JsonNode cancelOrder(String orderId) {
+    public JsonNode cancelOrder(String orderId, BusinessIdentity identity) {
         return restClient.post()
                 .uri(properties.cancelPath(), orderId)
+                .headers(headers -> applyIdentity(headers, identity))
                 .retrieve()
                 .body(JsonNode.class);
+    }
+
+    private static void applyIdentity(HttpHeaders headers, BusinessIdentity identity) {
+        headers.set("X-User-Id", identity.userId());
+        headers.set("X-Tenant-Id", identity.tenantId());
+        headers.set("X-Roles", String.join(",", identity.roles()));
     }
 }
