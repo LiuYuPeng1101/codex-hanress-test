@@ -8,10 +8,11 @@ from openai_codex import Sandbox
 
 @dataclass(frozen=True, slots=True)
 class McpToolPolicy:
-    """单个 MCP Tool 的运行策略。"""
+    """单个 MCP Tool 的治理策略。"""
 
     name: str
     approval_mode: str
+    output_token_limit: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,13 +23,16 @@ class McpServerDefinition:
     url: str
     tools: tuple[McpToolPolicy, ...]
     default_approval_mode: str = "prompt"
+    required: bool = True
+    startup_timeout_sec: int = 10
+    tool_timeout_sec: int = 30
 
 
 @dataclass(frozen=True, slots=True)
 class AgentDefinition:
     """一个可运行 Agent 的生产配置。
 
-    Runtime 只消费这个定义，不应该知道订单、合同、财务等业务名称。
+    CodexRuntime 只消费这个定义，不应该知道订单、合同、财务等业务名称。
     """
 
     id: str
@@ -39,11 +43,7 @@ class AgentDefinition:
 
 
 def build_order_agent(*, workspace: Path, order_mcp_url: str) -> AgentDefinition:
-    """构建订单 Agent Definition。
-
-    订单 Agent 本地只需要读取 Skill 和工作区，因此使用 read-only Sandbox；
-    查询 Tool 自动执行，写操作取消订单必须进入人工 Approval。
-    """
+    """构建订单 Agent Definition。"""
 
     return AgentDefinition(
         id="order",
@@ -55,9 +55,12 @@ def build_order_agent(*, workspace: Path, order_mcp_url: str) -> AgentDefinition
                 name="order",
                 url=order_mcp_url,
                 default_approval_mode="prompt",
+                required=True,
+                startup_timeout_sec=10,
+                tool_timeout_sec=30,
                 tools=(
-                    McpToolPolicy("get_order_status", "approve"),
-                    McpToolPolicy("cancel_order", "prompt"),
+                    McpToolPolicy("get_order_status", "approve", 1024),
+                    McpToolPolicy("cancel_order", "prompt", 1024),
                 ),
             ),
         ),
