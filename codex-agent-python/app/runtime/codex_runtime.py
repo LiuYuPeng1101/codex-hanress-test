@@ -20,15 +20,15 @@ from app.observability.tracing import get_tracer
 class CodexRuntime:
     """对官方 OpenAI Codex Python SDK 的轻量封装。
 
-    这一层只负责 Codex Runtime 能力，不应该放具体订单、财务、合同业务逻辑。
+    这一层只负责 Codex Runtime 能力，不放具体订单、财务、合同业务逻辑。
     FastAPI 启动时创建一份 Runtime，应用关闭时统一释放。
 
-    当前 Runtime 会把 Java 业务系统的订单 MCP Server 注入 Codex 配置，并把
-    MCP 写操作的 Approval Server Request 转给上层 ApprovalService 处理。
-
-    当前订单 Agent 采用最小权限原则：本地 Sandbox 固定为 read-only。
-    Agent 可以读取 workspace 中的 Skill / 文档 / 源码，但不能修改本地文件。
-    真实订单写操作仍通过受治理的 MCP Tool + Approval + Java 业务权限执行。
+    当前订单 Agent 使用：
+    - Java MCP Server 提供真实业务能力；
+    - Human Approval 控制高风险写操作；
+    - read-only Sandbox 限制本地执行环境；
+    - Event / SSE / OpenTelemetry 暴露运行过程；
+    - Thread Read / Compaction 用于学习长会话上下文管理。
     """
 
     def __init__(
@@ -56,8 +56,7 @@ class CodexRuntime:
         self._codex = AsyncCodex(config=config)
 
         # 当前官方 AsyncCodex 高层构造器暂未直接暴露 approval_handler。
-        # 但其内部 AsyncCodexClient 包装的是官方 CodexClient，后者原生支持 approval_handler。
-        # 因此这里把适配限制在 Runtime 内部，不让 API / Service 层依赖 SDK 私有结构。
+        # 这里把 SDK 私有适配限制在 Runtime 内部，不让 API / Service 层依赖内部结构。
         self._codex._client._sync._approval_handler = approval_handler
         self._started = False
 
@@ -90,15 +89,7 @@ class CodexRuntime:
         self._started = False
 
     async def create_thread(self) -> str:
-        """创建使用人工 reviewer + read-only Sandbox 的 Codex Thread。
-
-        这里同时明确两类安全边界：
-
-        1. Approval：高风险 MCP 写操作交给真实用户审批；
-        2. Sandbox：Agent 本地执行环境只允许读取，不允许修改 workspace 文件。
-
-        二者不是替代关系。即使某个业务 Tool 获得 Approval，本地文件系统仍然保持只读。
-        """
+        """创建使用人工 reviewer + read-only Sandbox 的 Codex Thread。"""
 
         self._ensure_started()
         params = ThreadStartParams(
@@ -110,12 +101,37 @@ class CodexRuntime:
         started = await self._codex._client.thread_start(params)
         return started.thread.id
 
-    async def run_turn(self, thread_id: str, message: str) -> str:
-        """执行一轮非流式 Turn，兼容原有一次性返回最终答案的 API。
+    async def read_thread(self, thread_id: str) -> dict[str, Any]:
+        """读取 Thread 快照，并包含 Turn 历史。
 
-        Turn 层再次显式传入 Sandbox.read_only，避免依赖 Runtime 或历史 Thread 的隐式默认值。
-        这样这个订单 Agent 的最小权限策略在代码上始终可见。
+        这里读取的是 Codex 持久化的 Thread/Turn 结构，主要用于学习和诊断。
+        它不等于“下一次模型请求会把这些内容全部原样塞进 Context Window”。
         """
+
+        self._ensure_started()
+        thread: AsyncThread = await self._codex.thread_resume(
+            thread_id,
+            cwd=str(self._workspace),
+        )
+        response = await thread.read(include_turns=True)
+        return response.model_dump(by_alias=True, mode="json")
+
+    async def compact_thread(self, thread_id: str) -> None:
+        """触发一次手动 Thread Compaction。
+
+        官方接口是 `thread/compact/start`，因此这里的返回只表示已经成功发起压缩，
+        不把“请求已受理”误写成“压缩已经同步完成”。
+        """
+
+        self._ensure_started()
+        thread: AsyncThread = await self._codex.thread_resume(
+            thread_id,
+            cwd=str(self._workspace),
+        )
+        await thread.compact()
+
+    async def run_turn(self, thread_id: str, message: str) -> str:
+        """执行一轮非流式 Turn，兼容原有一次性返回最终答案的 API。"""
 
         self._ensure_started()
         with self._tracer.start_as_current_span("agent.turn") as span:
@@ -140,11 +156,7 @@ class CodexRuntime:
             return result.final_response or ""
 
     async def stream_turn(self, thread_id: str, message: str) -> AsyncIterator[AgentEvent]:
-        """执行一轮流式 Turn，并逐条输出经过安全映射的 AgentEvent。
-
-        使用官方公开的 AsyncThread.turn() + AsyncTurnHandle.stream()，而不是自己读取
-        App Server stdout。流式 Turn 与非流式 Turn 使用同一套 read-only Sandbox 策略。
-        """
+        """执行一轮流式 Turn，并逐条输出经过安全映射的 AgentEvent。"""
 
         self._ensure_started()
         thread: AsyncThread = await self._codex.thread_resume(
