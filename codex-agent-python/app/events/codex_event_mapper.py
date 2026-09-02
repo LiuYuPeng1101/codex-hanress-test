@@ -33,11 +33,13 @@ class CodexEventMapper:
             return AgentEvent("turn.started", thread_id, turn_id)
 
         if method == "turn/completed":
+            # 官方协议把 status / error 等字段放在 params.turn 内，而不是 params 顶层。
+            turn = self._to_dict(params.get("turn"))
             return AgentEvent(
                 "turn.completed",
                 thread_id,
                 turn_id,
-                self._pick(params, "status", "error"),
+                self._pick(turn, "status", "error", "durationMs"),
             )
 
         if method == "item/agentMessage/delta":
