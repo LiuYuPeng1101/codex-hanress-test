@@ -1,34 +1,38 @@
-# codex-hanress-test
+# Enterprise Agent Runtime with Codex Harness
 
-这个仓库现在包含两个互补的学习项目：
+这个仓库实现一套生产导向的企业 Agent Runtime Kernel，并使用 **Order Agent** 作为第一套 Agent Definition。
 
-- `hanress-test/`：Java / Spring Boot 直接通过 Codex App Server 学习 Codex Harness 底层协议、Thread / Turn、MCP、Skill、Approval。
-- `codex-agent-python/`：标准 FastAPI Agent Service，使用官方 `openai-codex` Python SDK，作为以后真实企业 Agent Service 的雏形。
+```text
+codex-agent-python/
+→ Agent Runtime Service
+→ Agent Definition / Conversation / Approval / Event / OTel
+→ CodexRuntime Adapter
+→ OpenAI Codex Harness
 
-## Java 版本
+hanress-test/
+→ Order MCP Adapter
+→ 把受治理的 MCP Tool 转换成真实订单后端调用
+```
 
-完整说明：
+整体架构：
 
-- `hanress-test/README.md`
+```text
+Business Client
+      ↓
+Agent Runtime Service
+      ↓
+Codex Harness
+      ↓ MCP
+Order MCP Adapter
+      ↓
+Real Order Backend
+```
 
-重点：
+`codex-agent-python` 不重新实现 Agent Loop，而是把 Codex Harness 的 Thread、Skill、MCP、Approval、Sandbox、Event、Context 和 Compaction 转成稳定的企业 Runtime 契约。
 
-- Java 如何通过 App Server 控制 Codex Harness
-- Spring Boot 如何通过 MCP 暴露业务 Tool / Resource / Prompt
-- `.agents/skills` 如何被 Codex 按 Agent workspace 自动发现
-- Approval / Server Request 如何工作
+`hanress-test` 已不再启动 Codex，也不保存固定订单或内存业务状态；它只承担 Business MCP Adapter 职责。
 
-## Python 版本
-
-完整说明：
+详细架构、Codex 内部机制映射、真实订单执行链和生产边界见：
 
 - `codex-agent-python/README.md`
-
-重点：
-
-- 标准 FastAPI 项目结构
-- 官方 `openai-codex` Python SDK
-- FastAPI lifespan 管理一份 `AsyncCodex` Runtime
-- HTTP API 创建 Thread、执行 Turn
-- `.agents/skills` 随 Agent Service 一起部署
-- 后续通过 MCP 调用现有 Java 业务系统
+- `hanress-test/README.md`
