@@ -17,6 +17,8 @@ class ApprovalResponse(BaseModel):
     created_at: datetime
     decided_at: datetime | None
     decision: str | None
+    decided_by: str | None
+    decided_tenant_id: str | None
 
 
 class ApprovalListResponse(BaseModel):
