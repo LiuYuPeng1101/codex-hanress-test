@@ -8,6 +8,8 @@ from openai_codex.generated.v2_all import (
     AskForApproval,
     AskForApprovalValue,
     SandboxMode,
+    SkillsListParams,
+    SkillsListResponse,
     ThreadStartParams,
 )
 
@@ -20,8 +22,8 @@ from app.observability.tracing import get_tracer
 class CodexRuntime:
     """Codex Harness 的生产级 Runtime Adapter。
 
-    Runtime 只负责把通用 AgentDefinition 转换成 Codex Thread / Turn / MCP / Sandbox /
-    Approval / Event 调用，不包含订单、合同、客服等任何具体业务逻辑。
+    Runtime 只负责把通用 AgentDefinition 转换成 Codex Thread / Turn / Skill / MCP /
+    Approval / Sandbox / Event / Context 调用，不包含订单、合同、客服等具体业务逻辑。
     """
 
     def __init__(
@@ -32,13 +34,12 @@ class CodexRuntime:
         self._definition = definition
         self._event_mapper = CodexEventMapper()
         self._tracer = get_tracer()
-
         self._codex = AsyncCodex(
             config=CodexConfig(config_overrides=self._build_config_overrides(definition))
         )
 
         # 当前官方 AsyncCodex 高层构造器暂未直接暴露 approval_handler。
-        # 将 SDK 私有适配严格限制在 Runtime Adapter 内，业务层不依赖该内部结构。
+        # SDK 私有适配严格限制在 Runtime Adapter 内，业务层不依赖内部结构。
         self._codex._client._sync._approval_handler = approval_handler
         self._started = False
 
@@ -47,23 +48,26 @@ class CodexRuntime:
         return self._definition.id
 
     async def start(self) -> None:
-        """启动 Codex Runtime 连接。"""
+        """启动 Runtime，并验证 Agent Definition 对 Codex 来说真实可运行。"""
 
         if self._started:
             return
         await self._codex.__aenter__()
+        try:
+            await self._validate_required_skills()
+        except Exception:
+            await self._codex.__aexit__(None, None, None)
+            raise
         self._started = True
 
     async def close(self) -> None:
-        """关闭 Codex Runtime 连接并释放底层进程资源。"""
-
         if not self._started:
             return
         await self._codex.__aexit__(None, None, None)
         self._started = False
 
     async def create_thread(self) -> str:
-        """按照 Agent Definition 创建一个 Codex Thread。"""
+        """按照 Agent Definition 创建 Codex Thread。"""
 
         self._ensure_started()
         params = ThreadStartParams(
@@ -76,15 +80,11 @@ class CodexRuntime:
         return started.thread.id
 
     async def run_turn(self, thread_id: str, message: str) -> str:
-        """在已有 Thread 上执行一轮非流式 Turn。"""
-
         self._ensure_started()
         with self._tracer.start_as_current_span("agent.turn") as span:
             self._decorate_span(span, thread_id, streaming=False)
-
             thread = await self._resume_thread(thread_id)
             result = await thread.run(message, sandbox=self._definition.sandbox)
-
             span.set_attribute("agent.turn.id", result.id)
             span.set_attribute("agent.turn.status", str(result.status))
             if result.duration_ms is not None:
@@ -92,8 +92,6 @@ class CodexRuntime:
             return result.final_response or ""
 
     async def stream_turn(self, thread_id: str, message: str) -> AsyncIterator[AgentEvent]:
-        """执行流式 Turn，并输出经过稳定协议映射的 AgentEvent。"""
-
         self._ensure_started()
         thread = await self._resume_thread(thread_id)
         turn = await thread.turn(message, sandbox=self._definition.sandbox)
@@ -120,30 +118,55 @@ class CodexRuntime:
                 yield event
 
     async def read_thread(self, thread_id: str) -> dict[str, Any]:
-        """读取 Codex 持久化 Thread 与 Turn 历史。"""
-
         self._ensure_started()
         thread = await self._resume_thread(thread_id)
         response = await thread.read(include_turns=True)
         return response.model_dump(by_alias=True, mode="json")
 
     async def compact_thread(self, thread_id: str) -> None:
-        """触发 Codex Thread Compaction。
-
-        官方接口是 thread/compact/start，因此本方法只保证压缩请求已被接受，不把它伪装成同步完成。
-        """
+        """触发 Codex thread/compact/start。"""
 
         self._ensure_started()
         thread = await self._resume_thread(thread_id)
         await thread.compact()
 
     async def _resume_thread(self, thread_id: str) -> AsyncThread:
-        """从 Codex 持久化状态恢复 Thread，而不是依赖 Python 进程内对象缓存。"""
-
         return await self._codex.thread_resume(
             thread_id,
             cwd=str(self._definition.workspace),
         )
+
+    async def _validate_required_skills(self) -> None:
+        """通过 Codex skills/list 校验 Agent Definition 的必需 Skill。
+
+        required_skills 不是文档字段：缺失或被禁用时服务启动失败，避免 Agent 进入半可用状态。
+        """
+
+        if not self._definition.required_skills:
+            return
+
+        params = SkillsListParams(
+            cwds=[str(self._definition.workspace)],
+            force_reload=True,
+        )
+        response = await self._codex._client.request(
+            "skills/list",
+            params.model_dump(by_alias=True, exclude_none=True, mode="json"),
+            response_model=SkillsListResponse,
+        )
+
+        discovered = {
+            skill.name
+            for entry in response.data
+            for skill in entry.skills
+            if skill.enabled
+        }
+        missing = set(self._definition.required_skills) - discovered
+        if missing:
+            raise RuntimeError(
+                f"Agent '{self._definition.id}' 缺少必需 Skill: {sorted(missing)}; "
+                f"workspace={self._definition.workspace}"
+            )
 
     def _decorate_span(self, span, thread_id: str, *, streaming: bool) -> None:
         span.set_attribute("agent.id", self._definition.id)
@@ -154,19 +177,28 @@ class CodexRuntime:
 
     @staticmethod
     def _build_config_overrides(definition: AgentDefinition) -> tuple[str, ...]:
+        """把平台无关 Agent Definition 编译成 Codex MCP 配置。"""
+
         overrides: list[str] = []
         for server in definition.mcp_servers:
             prefix = f"mcp_servers.{server.name}"
-            overrides.append(f"{prefix}.url={json.dumps(server.url)}")
-            overrides.append(
-                f"{prefix}.enabled_tools={json.dumps([tool.name for tool in server.tools])}"
-            )
-            overrides.append(
-                f"{prefix}.default_tools_approval_mode={json.dumps(server.default_approval_mode)}"
+            overrides.extend(
+                [
+                    f"{prefix}.url={json.dumps(server.url)}",
+                    f"{prefix}.required={json.dumps(server.required)}",
+                    f"{prefix}.startup_timeout_sec={server.startup_timeout_sec}",
+                    f"{prefix}.tool_timeout_sec={server.tool_timeout_sec}",
+                    f"{prefix}.enabled_tools={json.dumps([tool.name for tool in server.tools])}",
+                    f"{prefix}.default_tools_approval_mode={json.dumps(server.default_approval_mode)}",
+                ]
             )
             for tool in server.tools:
-                overrides.append(
-                    f"{prefix}.tools.{tool.name}.approval_mode={json.dumps(tool.approval_mode)}"
+                tool_prefix = f"{prefix}.tools.{tool.name}"
+                overrides.extend(
+                    [
+                        f"{tool_prefix}.approval_mode={json.dumps(tool.approval_mode)}",
+                        f"{tool_prefix}.output_token_limit={tool.output_token_limit}",
+                    ]
                 )
         return tuple(overrides)
 
