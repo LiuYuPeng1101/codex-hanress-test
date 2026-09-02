@@ -8,6 +8,7 @@ def test_required_production_settings() -> None:
         _env_file=None,
         order_mcp_url="http://order-service:8080/mcp",
         database_url="postgresql+psycopg://agent:test@postgres:5432/agent_runtime",
+        gateway_shared_secret="a-production-secret-with-at-least-32-chars",
     )
 
     assert settings.api_prefix == "/api/v1"
