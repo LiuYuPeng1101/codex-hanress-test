@@ -9,6 +9,9 @@ class ApprovalResponse(BaseModel):
 
     id: str
     method: str
+    thread_id: str | None
+    turn_id: str | None
+    server_name: str | None
     params: dict[str, Any]
     status: str
     created_at: datetime
