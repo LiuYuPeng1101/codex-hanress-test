@@ -12,9 +12,14 @@ from app.schemas.agent import (
     RunTurnResponse,
     ThreadReadResponse,
 )
+from app.security.gateway_auth import require_gateway_principal
 from app.services.agent_service import AgentService
 
-router = APIRouter(prefix="/agents", tags=["Agent"])
+router = APIRouter(
+    prefix="/agents",
+    tags=["Agent"],
+    dependencies=[Depends(require_gateway_principal)],
+)
 
 
 @router.post("/threads", response_model=CreateThreadResponse)
@@ -32,11 +37,7 @@ async def read_thread(
     thread_id: str,
     service: Annotated[AgentService, Depends(get_agent_service)],
 ) -> ThreadReadResponse:
-    """读取 Thread 快照，并包含 Turn 历史。
-
-    这个接口用于观察“持久化 Thread 历史”，不要把它误解成模型下一轮一定会原样看到的
-    Effective Context。Context 可能经过 Harness 的裁剪、替换或 Compaction。
-    """
+    """读取 Thread 快照，并包含 Turn 历史。"""
 
     snapshot = await service.read_conversation(thread_id)
     return ThreadReadResponse(thread=snapshot["thread"])
@@ -47,10 +48,7 @@ async def compact_thread(
     thread_id: str,
     service: Annotated[AgentService, Depends(get_agent_service)],
 ) -> CompactThreadResponse:
-    """触发 Thread 手动 Compaction。
-
-    官方底层接口是 `thread/compact/start`，因此这里只表示压缩已成功发起。
-    """
+    """触发官方 `thread/compact/start`，响应只表示压缩已发起。"""
 
     await service.compact_conversation(thread_id)
     return CompactThreadResponse(thread_id=thread_id, status="COMPACTION_STARTED")
