@@ -5,12 +5,15 @@ from pydantic import BaseModel
 
 
 class ApprovalResponse(BaseModel):
-    """审批记录响应。"""
+    """企业审批记录响应。"""
 
     id: str
+    conversation_id: str
+    requester_user_id: str
+    tenant_id: str
     method: str
-    thread_id: str | None
-    turn_id: str | None
+    runtime_thread_id: str | None
+    runtime_turn_id: str | None
     server_name: str | None
     params: dict[str, Any]
     status: str
@@ -18,10 +21,7 @@ class ApprovalResponse(BaseModel):
     decided_at: datetime | None
     decision: str | None
     decided_by: str | None
-    decided_tenant_id: str | None
 
 
 class ApprovalListResponse(BaseModel):
-    """待审批/历史审批列表。"""
-
     items: list[ApprovalResponse]
