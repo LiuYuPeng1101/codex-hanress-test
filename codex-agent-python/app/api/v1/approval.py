@@ -6,7 +6,7 @@ from app.api.deps import get_approval_service
 from app.approval.approval_repository import ApprovalRequest
 from app.approval.approval_service import ApprovalService
 from app.schemas.approval import ApprovalListResponse, ApprovalResponse
-from app.security.gateway_auth import GatewayPrincipal, require_gateway_principal
+from app.security.gateway_auth import GatewayPrincipal, require_approval_principal
 
 router = APIRouter(prefix="/approvals", tags=["Approval"])
 
@@ -14,9 +14,12 @@ router = APIRouter(prefix="/approvals", tags=["Approval"])
 def _to_response(item: ApprovalRequest) -> ApprovalResponse:
     return ApprovalResponse(
         id=item.id,
+        conversation_id=item.conversation_id,
+        requester_user_id=item.requester_user_id,
+        tenant_id=item.tenant_id,
         method=item.method,
-        thread_id=item.thread_id,
-        turn_id=item.turn_id,
+        runtime_thread_id=item.thread_id,
+        runtime_turn_id=item.turn_id,
         server_name=item.server_name,
         params=item.params,
         status=item.status,
@@ -24,25 +27,29 @@ def _to_response(item: ApprovalRequest) -> ApprovalResponse:
         decided_at=item.decided_at,
         decision=item.decision,
         decided_by=item.decided_by,
-        decided_tenant_id=item.decided_tenant_id,
     )
 
 
 @router.get("", response_model=ApprovalListResponse)
 def list_approvals(
     service: Annotated[ApprovalService, Depends(get_approval_service)],
-    _principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
+    principal: Annotated[GatewayPrincipal, Depends(require_approval_principal)],
 ) -> ApprovalListResponse:
-    """查询最近审批记录。"""
+    """只返回当前租户审批记录；跨租户审批从查询层即隔离。"""
 
-    return ApprovalListResponse(items=[_to_response(item) for item in service.list_approvals()])
+    return ApprovalListResponse(
+        items=[
+            _to_response(item)
+            for item in service.list_approvals(tenant_id=principal.tenant_id)
+        ]
+    )
 
 
 @router.post("/{approval_id}/approve", response_model=ApprovalResponse)
 def approve(
     approval_id: str,
     service: Annotated[ApprovalService, Depends(get_approval_service)],
-    principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
+    principal: Annotated[GatewayPrincipal, Depends(require_approval_principal)],
 ) -> ApprovalResponse:
     try:
         return _to_response(
@@ -62,7 +69,7 @@ def approve(
 def reject(
     approval_id: str,
     service: Annotated[ApprovalService, Depends(get_approval_service)],
-    principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
+    principal: Annotated[GatewayPrincipal, Depends(require_approval_principal)],
 ) -> ApprovalResponse:
     try:
         return _to_response(
