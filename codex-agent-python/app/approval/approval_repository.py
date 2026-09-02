@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, MetaData, String, Table, Column, create_engine, insert, select, text, update
+from sqlalchemy import Column, DateTime, MetaData, String, Table, create_engine, insert, select, text, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
 
 
@@ -16,6 +17,9 @@ class ApprovalRequest:
 
     id: str
     method: str
+    thread_id: str | None
+    turn_id: str | None
+    server_name: str | None
     params: dict[str, Any]
     status: str
     created_at: datetime
@@ -34,7 +38,10 @@ approval_requests = Table(
     metadata,
     Column("id", String(36), primary_key=True),
     Column("method", String(128), nullable=False),
-    Column("params", JSON, nullable=False),
+    Column("thread_id", String(128), nullable=True),
+    Column("turn_id", String(128), nullable=True),
+    Column("server_name", String(128), nullable=True),
+    Column("params", JSONB, nullable=False),
     Column("status", String(32), nullable=False),
     Column("decision", String(32), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
@@ -68,6 +75,9 @@ class ApprovalRepository:
         item = ApprovalRequest(
             id=str(uuid.uuid4()),
             method=method,
+            thread_id=self._optional_text(params, "threadId", "thread_id"),
+            turn_id=self._optional_text(params, "turnId", "turn_id"),
+            server_name=self._optional_text(params, "serverName", "server_name"),
             params=params,
             status="PENDING",
             created_at=now,
@@ -79,6 +89,9 @@ class ApprovalRepository:
                 insert(approval_requests).values(
                     id=item.id,
                     method=item.method,
+                    thread_id=item.thread_id,
+                    turn_id=item.turn_id,
+                    server_name=item.server_name,
                     params=item.params,
                     status=item.status,
                     created_at=item.created_at,
@@ -160,10 +173,21 @@ class ApprovalRepository:
             )
 
     @staticmethod
+    def _optional_text(params: dict[str, Any], *keys: str) -> str | None:
+        for key in keys:
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @staticmethod
     def _from_row(row: Any) -> ApprovalRequest:
         return ApprovalRequest(
             id=row["id"],
             method=row["method"],
+            thread_id=row["thread_id"],
+            turn_id=row["turn_id"],
+            server_name=row["server_name"],
             params=dict(row["params"]),
             status=row["status"],
             created_at=row["created_at"],
