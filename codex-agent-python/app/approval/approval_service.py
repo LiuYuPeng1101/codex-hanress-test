@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.approval.approval_repository import (
-    ApprovalRepository,
-    ApprovalTimeoutError,
-)
+from app.approval.approval_repository import ApprovalRepository, ApprovalTimeoutError
 
 
 class ApprovalService:
@@ -48,8 +45,18 @@ class ApprovalService:
     def list_approvals(self):
         return self._repository.list_all()
 
-    def approve(self, approval_id: str):
-        return self._repository.decide(approval_id, "approve")
+    def approve(self, approval_id: str, *, user_id: str, tenant_id: str):
+        return self._repository.decide(
+            approval_id,
+            "approve",
+            decided_by=user_id,
+            decided_tenant_id=tenant_id,
+        )
 
-    def reject(self, approval_id: str):
-        return self._repository.decide(approval_id, "reject")
+    def reject(self, approval_id: str, *, user_id: str, tenant_id: str):
+        return self._repository.decide(
+            approval_id,
+            "reject",
+            decided_by=user_id,
+            decided_tenant_id=tenant_id,
+        )
