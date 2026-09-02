@@ -6,6 +6,7 @@ from app.api.deps import get_approval_service
 from app.approval.approval_repository import ApprovalRequest
 from app.approval.approval_service import ApprovalService
 from app.schemas.approval import ApprovalListResponse, ApprovalResponse
+from app.security.gateway_auth import GatewayPrincipal, require_gateway_principal
 
 router = APIRouter(prefix="/approvals", tags=["Approval"])
 
@@ -22,14 +23,17 @@ def _to_response(item: ApprovalRequest) -> ApprovalResponse:
         created_at=item.created_at,
         decided_at=item.decided_at,
         decision=item.decision,
+        decided_by=item.decided_by,
+        decided_tenant_id=item.decided_tenant_id,
     )
 
 
 @router.get("", response_model=ApprovalListResponse)
 def list_approvals(
     service: Annotated[ApprovalService, Depends(get_approval_service)],
+    _principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
 ) -> ApprovalListResponse:
-    """查询最近审批记录。同步端点由 FastAPI 在线程池执行，避免阻塞主事件循环。"""
+    """查询最近审批记录。"""
 
     return ApprovalListResponse(items=[_to_response(item) for item in service.list_approvals()])
 
@@ -38,9 +42,16 @@ def list_approvals(
 def approve(
     approval_id: str,
     service: Annotated[ApprovalService, Depends(get_approval_service)],
+    principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
 ) -> ApprovalResponse:
     try:
-        return _to_response(service.approve(approval_id))
+        return _to_response(
+            service.approve(
+                approval_id,
+                user_id=principal.user_id,
+                tenant_id=principal.tenant_id,
+            )
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="审批记录不存在") from exc
     except ValueError as exc:
@@ -51,9 +62,16 @@ def approve(
 def reject(
     approval_id: str,
     service: Annotated[ApprovalService, Depends(get_approval_service)],
+    principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
 ) -> ApprovalResponse:
     try:
-        return _to_response(service.reject(approval_id))
+        return _to_response(
+            service.reject(
+                approval_id,
+                user_id=principal.user_id,
+                tenant_id=principal.tenant_id,
+            )
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="审批记录不存在") from exc
     except ValueError as exc:
