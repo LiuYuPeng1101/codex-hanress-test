@@ -1,4 +1,5 @@
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Callable
 
@@ -9,6 +10,10 @@ from openai_codex.generated.v2_all import (
     AskForApprovalValue,
     ThreadStartParams,
 )
+
+from app.events.codex_event_mapper import CodexEventMapper
+from app.events.models import AgentEvent
+from app.observability.tracing import get_tracer
 
 
 class CodexRuntime:
@@ -29,6 +34,8 @@ class CodexRuntime:
     ) -> None:
         self._workspace = workspace.resolve()
         self._order_mcp_url = order_mcp_url
+        self._event_mapper = CodexEventMapper()
+        self._tracer = get_tracer()
 
         # MCP Tool 策略：查询自动执行，取消订单必须进入 Approval。
         config = CodexConfig(
@@ -95,10 +102,31 @@ class CodexRuntime:
         return started.thread.id
 
     async def run_turn(self, thread_id: str, message: str) -> str:
-        """在已有 Thread 中执行一轮 Turn，并返回最终回答。
+        """执行一轮非流式 Turn，兼容原有一次性返回最终答案的 API。"""
 
-        当本轮调用 cancel_order 时，Codex 会暂停在 MCP Tool Approval，直到
-        ApprovalService 返回 accept 或 decline；查询类 get_order_status 不需要人工审批。
+        self._ensure_started()
+        with self._tracer.start_as_current_span("agent.turn") as span:
+            span.set_attribute("agent.thread.id", thread_id)
+            span.set_attribute("agent.streaming", False)
+
+            thread: AsyncThread = await self._codex.thread_resume(
+                thread_id,
+                cwd=str(self._workspace),
+            )
+            result = await thread.run(message)
+
+            span.set_attribute("agent.turn.id", result.id)
+            span.set_attribute("agent.turn.status", str(result.status))
+            if result.duration_ms is not None:
+                span.set_attribute("agent.turn.duration_ms", result.duration_ms)
+
+            return result.final_response or ""
+
+    async def stream_turn(self, thread_id: str, message: str) -> AsyncIterator[AgentEvent]:
+        """执行一轮流式 Turn，并逐条输出经过安全映射的 AgentEvent。
+
+        使用官方公开的 AsyncThread.turn() + AsyncTurnHandle.stream()，而不是自己读取
+        App Server stdout。这样不同 Turn 的 Notification 仍由 SDK 按 turn_id 正确路由。
         """
 
         self._ensure_started()
@@ -106,8 +134,28 @@ class CodexRuntime:
             thread_id,
             cwd=str(self._workspace),
         )
-        result = await thread.run(message)
-        return result.final_response
+        turn = await thread.turn(message)
+
+        with self._tracer.start_as_current_span("agent.turn.stream") as span:
+            span.set_attribute("agent.thread.id", thread_id)
+            span.set_attribute("agent.turn.id", turn.id)
+            span.set_attribute("agent.streaming", True)
+
+            async for notification in turn.stream():
+                event = self._event_mapper.map(notification, thread_id, turn.id)
+                if event is None:
+                    continue
+
+                attributes: dict[str, str] = {
+                    "agent.event.type": event.type,
+                    "agent.thread.id": thread_id,
+                    "agent.turn.id": turn.id,
+                }
+                tool_name = event.data.get("tool_name")
+                if tool_name:
+                    attributes["agent.tool.name"] = str(tool_name)
+                span.add_event(event.type, attributes=attributes)
+                yield event
 
     def _ensure_started(self) -> None:
         """防止在 FastAPI 生命周期尚未启动完成时调用 Runtime。"""

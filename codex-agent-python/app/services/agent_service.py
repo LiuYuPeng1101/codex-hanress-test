@@ -1,3 +1,6 @@
+from collections.abc import AsyncIterator
+
+from app.events.models import AgentEvent
 from app.runtime.codex_runtime import CodexRuntime
 
 
@@ -18,6 +21,12 @@ class AgentService:
         return await self._runtime.create_thread()
 
     async def chat(self, thread_id: str, message: str) -> str:
-        """在指定 Thread 中执行一轮 Turn。"""
+        """在指定 Thread 中执行一轮非流式 Turn。"""
 
         return await self._runtime.run_turn(thread_id, message)
+
+    async def stream_chat(self, thread_id: str, message: str) -> AsyncIterator[AgentEvent]:
+        """在指定 Thread 中执行一轮流式 Turn，并输出标准化 Agent Event。"""
+
+        async for event in self._runtime.stream_turn(thread_id, message):
+            yield event
