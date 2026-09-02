@@ -59,6 +59,4 @@ jobs:
           cache: maven
       - name: Maven tests
         working-directory: hanress-test
-        run: |
-          chmod +x mvnw
-          ./mvnw test
+        run: mvn -B test
