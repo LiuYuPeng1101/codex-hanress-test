@@ -90,36 +90,23 @@ class ApprovalStore:
         if decision not in {"approve", "reject"}:
             raise ValueError("decision 只能是 approve 或 reject")
 
-        record_key = self._record_key(approval_id)
-        decision_key = self._decision_key(approval_id)
-        decided_at = datetime.now(timezone.utc).isoformat()
+        status = "APPROVED" if decision == "approve" else "REJECTED"
+        return self._transition(
+            approval_id,
+            status=status,
+            decision=decision,
+            notify_waiter=True,
+        )
 
-        for _ in range(5):
-            with self._redis.pipeline() as pipe:
-                try:
-                    pipe.watch(record_key)
-                    status = pipe.hget(record_key, "status")
-                    if status is None:
-                        raise KeyError(approval_id)
-                    if self._decode(status) != "PENDING":
-                        raise ValueError("该审批已经处理，不能重复审批")
+    def expire(self, approval_id: str) -> ApprovalRequest:
+        """将仍处于 PENDING 的审批原子标记为 EXPIRED。"""
 
-                    pipe.multi()
-                    pipe.hset(
-                        record_key,
-                        mapping={
-                            "status": "APPROVED" if decision == "approve" else "REJECTED",
-                            "decision": decision,
-                            "decided_at": decided_at,
-                        },
-                    )
-                    pipe.rpush(decision_key, decision)
-                    pipe.expire(decision_key, self._wait_timeout_seconds)
-                    pipe.execute()
-                    return self.get(approval_id)
-                except WatchError:
-                    continue
-        raise RuntimeError("审批记录发生并发更新，请重试")
+        return self._transition(
+            approval_id,
+            status="EXPIRED",
+            decision=None,
+            notify_waiter=False,
+        )
 
     def wait_for_decision(self, approval_id: str) -> str:
         """等待跨进程可见的人工审批结果。"""
@@ -127,6 +114,8 @@ class ApprovalStore:
         current = self.get(approval_id)
         if current.decision:
             return current.decision
+        if current.status != "PENDING":
+            raise TimeoutError(f"审批已失效: {approval_id}")
 
         result = self._redis.blpop(
             self._decision_key(approval_id),
@@ -135,6 +124,46 @@ class ApprovalStore:
         if result is None:
             raise TimeoutError(f"审批等待超时: {approval_id}")
         return self._decode(result[1])
+
+    def _transition(
+        self,
+        approval_id: str,
+        *,
+        status: str,
+        decision: str | None,
+        notify_waiter: bool,
+    ) -> ApprovalRequest:
+        record_key = self._record_key(approval_id)
+        decision_key = self._decision_key(approval_id)
+        decided_at = datetime.now(timezone.utc).isoformat()
+
+        for _ in range(5):
+            with self._redis.pipeline() as pipe:
+                try:
+                    pipe.watch(record_key)
+                    current_status = pipe.hget(record_key, "status")
+                    if current_status is None:
+                        raise KeyError(approval_id)
+                    if self._decode(current_status) != "PENDING":
+                        raise ValueError("该审批已经处理，不能重复变更")
+
+                    pipe.multi()
+                    pipe.hset(
+                        record_key,
+                        mapping={
+                            "status": status,
+                            "decision": decision or "",
+                            "decided_at": decided_at,
+                        },
+                    )
+                    if notify_waiter and decision is not None:
+                        pipe.rpush(decision_key, decision)
+                        pipe.expire(decision_key, self._wait_timeout_seconds)
+                    pipe.execute()
+                    return self.get(approval_id)
+                except WatchError:
+                    continue
+        raise RuntimeError("审批记录发生并发更新，请重试")
 
     @staticmethod
     def _record_key(approval_id: str) -> str:
