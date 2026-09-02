@@ -16,7 +16,7 @@ from app.services.agent_service import AgentService
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """装配并释放生产运行依赖。
 
-    PostgreSQL、Codex Runtime 或迁移表不可用时直接启动失败，避免服务以半可用状态接收请求。
+    PostgreSQL、Codex Runtime、持久化目录或迁移表不可用时直接启动失败，避免半可用状态。
     """
 
     settings = get_settings()
@@ -38,6 +38,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     runtime = CodexRuntime(
         workspace=settings.agent_workspace,
+        codex_home=settings.codex_home,
         order_mcp_url=settings.order_mcp_url,
         order_mcp_service_token=settings.order_mcp_service_token,
         approval_handler=approval_service.handle_codex_request,
