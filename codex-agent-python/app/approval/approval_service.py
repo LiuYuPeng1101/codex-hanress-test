@@ -2,22 +2,26 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.approval.approval_store import ApprovalStore
+from app.approval.approval_repository import (
+    ApprovalRepository,
+    ApprovalTimeoutError,
+)
 
 
 class ApprovalService:
-    """连接 Codex approval handler 与业务审批 API 的应用服务。"""
+    """连接 Codex approval handler 与企业审批中心的应用服务。"""
 
     MCP_APPROVAL_METHOD = "mcpServer/elicitation/request"
 
-    def __init__(self, store: ApprovalStore) -> None:
-        self._store = store
+    def __init__(self, repository: ApprovalRepository, timeout_seconds: int) -> None:
+        self._repository = repository
+        self._timeout_seconds = timeout_seconds
 
     def handle_codex_request(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
-        """处理 Codex App Server 主动发来的审批请求。
+        """处理 Codex App Server 主动发来的 MCP Tool Approval 请求。
 
-        只把 `codex_approval_kind=mcp_tool_call` 的 MCP Tool Approval 交给人工处理。
-        其他未知 Server Request 默认返回空对象，避免误把它们当业务审批。
+        只有 `codex_approval_kind=mcp_tool_call` 才进入企业审批流程。审批记录先持久化，
+        然后同步等待外部审批中心写入 approve/reject；等待超时按拒绝处理，避免危险操作失控。
         """
 
         payload = params or {}
@@ -28,18 +32,24 @@ class ApprovalService:
         if meta.get("codex_approval_kind") != "mcp_tool_call":
             return {}
 
-        approval = self._store.create(method, payload)
-        decision = self._store.wait_for_decision(approval.id)
+        approval = self._repository.create(method, payload)
+        try:
+            decision = self._repository.wait_for_decision(
+                approval.id,
+                timeout_seconds=self._timeout_seconds,
+            )
+        except ApprovalTimeoutError:
+            return {"action": "decline", "content": None}
 
         if decision == "approve":
             return {"action": "accept", "content": {}}
         return {"action": "decline", "content": None}
 
     def list_approvals(self):
-        return self._store.list_all()
+        return self._repository.list_all()
 
     def approve(self, approval_id: str):
-        return self._store.decide(approval_id, "approve")
+        return self._repository.decide(approval_id, "approve")
 
     def reject(self, approval_id: str):
-        return self._store.decide(approval_id, "reject")
+        return self._repository.decide(approval_id, "reject")
