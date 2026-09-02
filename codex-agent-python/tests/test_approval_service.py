@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from unittest.mock import Mock
 
 from app.approval.approval_repository import ApprovalRequest, ApprovalTimeoutError
@@ -5,8 +6,6 @@ from app.approval.approval_service import ApprovalService
 
 
 def _pending_approval() -> ApprovalRequest:
-    from datetime import datetime, timezone
-
     return ApprovalRequest(
         id="approval-1",
         method="mcpServer/elicitation/request",
@@ -23,6 +22,8 @@ def _pending_approval() -> ApprovalRequest:
         created_at=datetime.now(timezone.utc),
         decided_at=None,
         decision=None,
+        decided_by=None,
+        decided_tenant_id=None,
     )
 
 
@@ -66,6 +67,21 @@ def test_mcp_tool_approval_declines_on_timeout() -> None:
     )
 
     assert result == {"action": "decline", "content": None}
+
+
+def test_human_decision_carries_trusted_actor_identity() -> None:
+    repository = Mock()
+    repository.decide.return_value = _pending_approval()
+    service = ApprovalService(repository, timeout_seconds=900)
+
+    service.approve("approval-1", user_id="user-7", tenant_id="tenant-a")
+
+    repository.decide.assert_called_once_with(
+        "approval-1",
+        "approve",
+        decided_by="user-7",
+        decided_tenant_id="tenant-a",
+    )
 
 
 def test_non_mcp_approval_request_is_not_interpreted_as_business_approval() -> None:
