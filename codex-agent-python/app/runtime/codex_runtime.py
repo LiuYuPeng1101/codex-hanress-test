@@ -18,17 +18,10 @@ from app.observability.tracing import get_tracer
 
 
 class CodexRuntime:
-    """对官方 OpenAI Codex Python SDK 的轻量封装。
+    """官方 OpenAI Codex Python SDK 的企业 Runtime Adapter。
 
-    这一层只负责 Codex Runtime 能力，不放具体订单、财务、合同业务逻辑。
-    FastAPI 启动时创建一份 Runtime，应用关闭时统一释放。
-
-    当前订单 Agent 使用：
-    - Java MCP Server 提供真实业务能力；
-    - Human Approval 控制高风险写操作；
-    - read-only Sandbox 限制本地执行环境；
-    - Event / SSE / OpenTelemetry 暴露运行过程；
-    - Thread Read / Compaction 用于学习长会话上下文管理。
+    Runtime 只处理 Codex Thread / Turn / Sandbox / Approval / Event / Context 等执行能力。
+    业务 conversation_id、用户、租户和 Agent Definition 由上层控制面管理。
     """
 
     def __init__(
@@ -38,11 +31,9 @@ class CodexRuntime:
         approval_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
     ) -> None:
         self._workspace = workspace.resolve()
-        self._order_mcp_url = order_mcp_url
         self._event_mapper = CodexEventMapper()
         self._tracer = get_tracer()
 
-        # MCP Tool 策略：查询自动执行，取消订单必须进入 Approval。
         config = CodexConfig(
             config_overrides=(
                 f"mcp_servers.order.url={json.dumps(order_mcp_url)}",
@@ -52,44 +43,27 @@ class CodexRuntime:
                 'mcp_servers.order.tools.cancel_order.approval_mode="prompt"',
             )
         )
-
         self._codex = AsyncCodex(config=config)
 
-        # 当前官方 AsyncCodex 高层构造器暂未直接暴露 approval_handler。
-        # 这里把 SDK 私有适配限制在 Runtime 内部，不让 API / Service 层依赖内部结构。
+        # 当前高层 AsyncCodex 尚未直接暴露人工 approval handler。
+        # 这段私有 SDK 适配被严格限制在 Runtime Adapter 内。
         self._codex._client._sync._approval_handler = approval_handler
         self._started = False
 
-    @property
-    def workspace(self) -> Path:
-        """返回当前 Agent 的工作目录。"""
-
-        return self._workspace
-
-    @property
-    def order_mcp_url(self) -> str:
-        """返回当前订单 MCP Server 地址。"""
-
-        return self._order_mcp_url
-
     async def start(self) -> None:
-        """启动 Codex Runtime。"""
-
         if self._started:
             return
         await self._codex.__aenter__()
         self._started = True
 
     async def close(self) -> None:
-        """关闭 Codex Runtime 并释放底层进程资源。"""
-
         if not self._started:
             return
         await self._codex.__aexit__(None, None, None)
         self._started = False
 
     async def create_thread(self) -> str:
-        """创建使用人工 reviewer + read-only Sandbox 的 Codex Thread。"""
+        """创建人工 reviewer + read-only Sandbox 的 Codex Thread。"""
 
         self._ensure_started()
         params = ThreadStartParams(
@@ -101,13 +75,13 @@ class CodexRuntime:
         started = await self._codex._client.thread_start(params)
         return started.thread.id
 
+    async def archive_thread(self, thread_id: str) -> None:
+        """归档无法绑定到业务 Conversation 的孤儿 Thread。"""
+
+        self._ensure_started()
+        await self._codex.thread_archive(thread_id)
+
     async def read_thread(self, thread_id: str) -> dict[str, Any]:
-        """读取 Thread 快照，并包含 Turn 历史。
-
-        这里读取的是 Codex 持久化的 Thread/Turn 结构，主要用于学习和诊断。
-        它不等于“下一次模型请求会把这些内容全部原样塞进 Context Window”。
-        """
-
         self._ensure_started()
         thread: AsyncThread = await self._codex.thread_resume(
             thread_id,
@@ -117,12 +91,6 @@ class CodexRuntime:
         return response.model_dump(by_alias=True, mode="json")
 
     async def compact_thread(self, thread_id: str) -> None:
-        """触发一次手动 Thread Compaction。
-
-        官方接口是 `thread/compact/start`，因此这里的返回只表示已经成功发起压缩，
-        不把“请求已受理”误写成“压缩已经同步完成”。
-        """
-
         self._ensure_started()
         thread: AsyncThread = await self._codex.thread_resume(
             thread_id,
@@ -130,12 +98,16 @@ class CodexRuntime:
         )
         await thread.compact()
 
-    async def run_turn(self, thread_id: str, message: str) -> str:
-        """执行一轮非流式 Turn，兼容原有一次性返回最终答案的 API。"""
-
+    async def run_turn(
+        self,
+        thread_id: str,
+        conversation_id: str,
+        message: str,
+    ) -> str:
         self._ensure_started()
         with self._tracer.start_as_current_span("agent.turn") as span:
-            span.set_attribute("agent.thread.id", thread_id)
+            span.set_attribute("agent.conversation.id", conversation_id)
+            span.set_attribute("agent.runtime.thread.id", thread_id)
             span.set_attribute("agent.streaming", False)
             span.set_attribute("agent.sandbox", Sandbox.read_only.value)
 
@@ -143,46 +115,44 @@ class CodexRuntime:
                 thread_id,
                 cwd=str(self._workspace),
             )
-            result = await thread.run(
-                message,
-                sandbox=Sandbox.read_only,
-            )
+            result = await thread.run(message, sandbox=Sandbox.read_only)
 
-            span.set_attribute("agent.turn.id", result.id)
+            span.set_attribute("agent.runtime.turn.id", result.id)
             span.set_attribute("agent.turn.status", str(result.status))
             if result.duration_ms is not None:
                 span.set_attribute("agent.turn.duration_ms", result.duration_ms)
-
             return result.final_response or ""
 
-    async def stream_turn(self, thread_id: str, message: str) -> AsyncIterator[AgentEvent]:
-        """执行一轮流式 Turn，并逐条输出经过安全映射的 AgentEvent。"""
-
+    async def stream_turn(
+        self,
+        thread_id: str,
+        conversation_id: str,
+        message: str,
+    ) -> AsyncIterator[AgentEvent]:
         self._ensure_started()
         thread: AsyncThread = await self._codex.thread_resume(
             thread_id,
             cwd=str(self._workspace),
         )
-        turn = await thread.turn(
-            message,
-            sandbox=Sandbox.read_only,
-        )
+        turn = await thread.turn(message, sandbox=Sandbox.read_only)
 
         with self._tracer.start_as_current_span("agent.turn.stream") as span:
-            span.set_attribute("agent.thread.id", thread_id)
-            span.set_attribute("agent.turn.id", turn.id)
+            span.set_attribute("agent.conversation.id", conversation_id)
+            span.set_attribute("agent.runtime.thread.id", thread_id)
+            span.set_attribute("agent.runtime.turn.id", turn.id)
             span.set_attribute("agent.streaming", True)
             span.set_attribute("agent.sandbox", Sandbox.read_only.value)
 
             async for notification in turn.stream():
-                event = self._event_mapper.map(notification, thread_id, turn.id)
+                event = self._event_mapper.map(notification, conversation_id)
                 if event is None:
                     continue
 
                 attributes: dict[str, str] = {
                     "agent.event.type": event.type,
-                    "agent.thread.id": thread_id,
-                    "agent.turn.id": turn.id,
+                    "agent.conversation.id": conversation_id,
+                    "agent.runtime.thread.id": thread_id,
+                    "agent.runtime.turn.id": turn.id,
                 }
                 tool_name = event.data.get("tool_name")
                 if tool_name:
@@ -191,7 +161,5 @@ class CodexRuntime:
                 yield event
 
     def _ensure_started(self) -> None:
-        """防止在 FastAPI 生命周期尚未启动完成时调用 Runtime。"""
-
         if not self._started:
             raise RuntimeError("Codex Runtime 尚未启动")
