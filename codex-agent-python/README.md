@@ -1,395 +1,287 @@
-# Codex Agent Python
+# Enterprise Agent Runtime on OpenAI Codex Harness
 
-这是一个基于 **FastAPI + 官方 OpenAI Codex Python SDK + Java/Spring Boot MCP Server** 的企业 Agent 学习项目。
+这个服务不是一个“通用 Agent 平台成品”，也不是一个把订单逻辑写死在 Prompt 里的业务机器人。
 
-目标不是做一个简单聊天机器人，而是逐步理解一个生产级 Agent Runtime / Harness 应该具备的核心能力。
+当前最准确的定位是：
 
-```text
-用户请求
-  ↓
-Thread / Turn
-  ↓
-Skill：告诉 Agent 应该怎么做
-  ↓
-MCP Tool：告诉 Agent 能做什么
-  ↓
-Approval：控制高风险动作能不能执行
-  ↓
-Sandbox：限制 Runtime 实际最多能碰到哪里
-  ↓
-Event / Streaming：实时暴露 Agent 正在做什么
-  ↓
-OpenTelemetry：把运行过程送到专业 Observability 平台
-  ↓
-Context / Compaction：管理长会话模型上下文
-  ↓
-Java Business System
-  ↓
-Business Authorization
-  ↓
-真实业务 Service
-```
+> **生产导向的 Agent Runtime Kernel + Codex Runtime Adapter + 一个 Order Agent Definition。**
+
+Codex Harness 是真正的通用执行引擎；本项目负责把 Codex 的 Thread、Skill、MCP、Approval、Sandbox、Event、Context、Compaction 等机制，转换成企业系统可以治理、持久化、观测和逐步平台化的 Runtime 契约。
+
+未来完整 Agent Gateway 会位于它的上层，负责身份、多租户、Agent Registry、统一 Conversation、Runtime Routing、策略、审计和配额。当前项目已经建立这些能力需要的核心边界，但还不是完整 Gateway。
 
 ---
 
-# 1. 当前项目结构
+# 1. 当前架构
 
 ```text
-codex-agent-python/
-├── app/
-│   ├── main.py
-│   ├── api/
-│   │   ├── deps.py
-│   │   └── v1/
-│   │       ├── router.py
-│   │       ├── health.py
-│   │       ├── agent.py             # Thread / Turn / Read / Compact / SSE API
-│   │       └── approval.py          # Approval API
-│   ├── approval/
-│   │   ├── approval_service.py
-│   │   └── approval_store.py
-│   ├── core/
-│   │   ├── config.py
-│   │   └── lifespan.py
-│   ├── events/
-│   │   ├── models.py                # 稳定的 AgentEvent
-│   │   └── codex_event_mapper.py    # Codex Notification → AgentEvent
-│   ├── observability/
-│   │   └── tracing.py               # OpenTelemetry Trace
-│   ├── runtime/
-│   │   └── codex_runtime.py         # Codex SDK Adapter
-│   ├── services/
-│   │   └── agent_service.py
-│   └── schemas/
-├── .agents/
-│   └── skills/
-│       └── order-analysis/
-│           └── SKILL.md
-├── docs/
-│   ├── approval.md
-│   └── sandbox.md
-├── tests/
-├── .env.example
-├── pyproject.toml
-└── README.md
+Business UI / API Client
+          │
+          │ conversation_id
+          ▼
+   Agent Runtime Service
+          │
+          ├── Conversation Repository (Redis)
+          ├── Approval Repository (Redis)
+          ├── Agent Definition
+          ├── AgentEvent / SSE
+          └── OpenTelemetry
+          │
+          ▼
+   CodexRuntime Adapter
+          │
+          ▼
+     OpenAI Codex SDK
+          │
+          ▼
+       Codex Harness
+          │
+   ┌──────┼────────┬──────────┬───────────┐
+   │      │        │          │           │
+ Skill   MCP    Approval   Sandbox   Context/Compaction
+   │      │        │          │           │
+   └──────┴────────┴──────────┴───────────┘
+          │
+          ▼
+      MCP HTTP
+          │
+          ▼
+    Order MCP Adapter
+          │
+          ▼
+    Real Order Backend
 ```
 
-Java `hanress-test` 模块模拟已有业务系统，通过：
-
-```text
-http://127.0.0.1:8080/mcp
-```
-
-暴露订单 MCP Server。
-
-当前 Tool：
-
-```text
-get_order_status
-→ 查询型 Tool
-→ 自动执行
-
-cancel_order
-→ 写操作 Tool
-→ approval_mode = prompt
-→ 必须人工审批
-```
+Java 模块只承担 **Business MCP Adapter**，不再启动 Codex，也不保存任何模拟订单状态。
 
 ---
 
-# 2. 企业 Agent 核心心智模型
+# 2. 四个层次必须分开
 
 ```text
-Thread / Turn
-= Agent 的会话与一次完整执行
+Order Agent Definition
+= 订单 Agent 的业务能力与治理配置
 
-Skill
-= Agent 应该怎么做（How）
+CodexRuntime
+= 把平台 Agent Definition 翻译成 Codex SDK / App Server 参数
 
-MCP Tool
-= Agent 能做什么（Capability）
-
-Approval
-= 这一次高风险动作能不能做（Control）
-
-Sandbox
-= Runtime 实际最多能碰到哪里（Execution Boundary）
-
-Event / Streaming
-= Agent 正在做什么（Runtime Visibility）
-
-OpenTelemetry
-= 如何把运行过程标准化送到专业观测平台
-
-Context
-= 这一轮模型真正拿来工作的上下文
-
-Compaction
-= 当上下文过大时，对会话历史做压缩替换
-
-Business Authorization
-= 当前用户在真实业务上最终有没有权限
-```
-
-最终关系：
-
-```text
-                         Agent Runtime / Harness
-                                  │
-      ┌──────────┬──────────┬─────┼─────┬─────────────┐
-      │          │          │           │             │
-    Skill      MCP Tool   Approval   Sandbox        Event
-   怎么做      能做什么    这次能否做   能碰哪里       做到哪了
-      │          │          │           │             │
-      └──────────┴──────────┴─────┬─────┴─────────────┘
-                                  ↓
-                         Context / Compaction
-                                  ↓
-                               Model
-                                  ↓
-                               MCP / I/O
-                                  ↓
-                         Java Business System
-                                  ↓
-                         Business Authorization
-                                  ↓
-                            Real Business
-```
-
----
-
-# 3. Thread / Turn
-
-## 3.1 Thread
-
-Thread 是持续存在的 Agent 会话，不是 Java Thread。
-
-```text
-Thread
-├── Turn 1
-├── Turn 2
-├── Turn 3
-└── ...
-```
-
-同一个 Thread 可以连续运行很多 Turn，并复用会话状态。
-
-创建 Thread：
-
-```http
-POST /api/v1/agents/threads
-```
-
-## 3.2 Turn
-
-Turn 是一次完整 Agent 执行：
-
-```text
-用户输入
-→ 模型判断
-→ Skill
-→ Tool
-→ Approval（如果需要）
-→ Tool Result
-→ 最终回答
-```
-
-普通非流式 API：
-
-```http
-POST /api/v1/agents/threads/{thread_id}/turns
-```
-
-当前实现本质上是：
-
-```python
-result = await thread.run(
-    message,
-    sandbox=Sandbox.read_only,
-)
-```
-
----
-
-# 4. Skill：Agent 应该怎么做
-
-当前 Skill：
-
-```text
-.agents/skills/order-analysis/SKILL.md
-```
-
-核心规则：
-
-```text
-1. 先识别订单 ID
-2. 不允许猜测实时订单状态
-3. 已接入 MCP Tool 时优先查询真实业务数据
-4. 区分事实数据和分析结论
-5. 最终用中文给出明确结论
-```
-
-一句话：
-
-```text
-Skill = How
-Tool = Action
-```
-
-Skill 不负责伪造业务事实，也不应该把真实业务逻辑写死在 Markdown 中。
-
-Skill 通过 Thread 的 `cwd` 被 Codex Harness 从：
-
-```text
-<workspace>/.agents/skills
-```
-
-发现，不需要业务代码手动注册。
-
----
-
-# 5. MCP / Tool：Agent 能做什么
-
-Python Agent Service 不直接调用 Java 业务 REST，而是：
-
-```text
-模型
- ↓
 Codex Harness
- ↓
-MCP Tool Discovery
- ↓
-Tool Call
- ↓
-Java MCP Server
- ↓
-Business Service
+= 真正执行 Agent Loop 的通用引擎
+
+Order MCP Adapter
+= 把受治理的 Agent Tool 映射到真实订单系统
 ```
 
-推荐 Tool 设计：
+因此新增 Finance Agent 或 Contract Agent 时，不应该复制 CodexRuntime；应该新增 Agent Definition、Skill 和对应 MCP Capability。
+
+---
+
+# 3. 为什么我们不是在“重新实现 Codex”
+
+本项目不自己实现 ReAct Loop、Tool 调度、上下文压缩、Sandbox 或 App Server 事件路由。
+
+这些能力由 Codex Harness 提供。我们做的是企业边界适配：
+
+```text
+Codex 原生能力
+        ↓
+CodexRuntime Adapter
+        ↓
+稳定的企业内部契约
+```
+
+这样做有三个价值：
+
+1. 业务系统不依赖 Codex 私有协议；
+2. Codex 的能力可以被企业策略治理，而不是让模型直接拥有无限权限；
+3. 将来可以新增其他 Runtime Adapter，而业务层继续使用统一 Conversation / Agent / Event 契约。
+
+---
+
+# 4. Skill 在 Codex 里到底是什么
+
+Skill 不是本项目自己做的 Prompt 路由器。
+
+Codex Thread 创建时有一个 `cwd`：
+
+```text
+AgentDefinition.workspace
+        ↓
+thread/start cwd
+        ↓
+Codex Harness
+        ↓
+<cwd>/.agents/skills
+```
+
+Codex 根据 workspace 发现 Skill，并使用 Skill 的 metadata / instructions 影响 Agent 的任务执行方式。
+
+当前 Order Agent 要求：
+
+```text
+required_skills = [order-analysis]
+```
+
+Runtime 启动时真实调用 Codex：
+
+```text
+skills/list
+```
+
+如果 `order-analysis` 不存在或被禁用，服务直接启动失败。`skills/list` 是 readiness 校验，不是注册动作。
+
+生产意义：Skill 是 **版本化业务 SOP**。例如客户问：
+
+```text
+“订单 A123 怎么还没到？”
+```
+
+Skill 约束 Codex：不得猜实时状态，必须先调用真实订单 Tool，再区分事实和分析。这里不是我们的 Python `if/else` 在强行路由，而是 Codex Harness 在 Agent Loop 中使用 Skill。
+
+---
+
+# 5. MCP 在 Codex 里到底是什么
+
+`CodexRuntime` 不自己用 `httpx` 调订单 API。
+
+Agent Definition 声明：
+
+```text
+MCP Server: order
+Tools:
+- get_order_status
+- cancel_order
+```
+
+Runtime 将其编译成 Codex `mcp_servers.*` 配置。Codex Harness 会：
+
+```text
+发现 MCP Tool Schema
+        ↓
+把 Tool 暴露给模型
+        ↓
+模型决定是否调用
+        ↓
+Harness 发起 MCP Tool Call
+        ↓
+Tool Result 回到当前 Turn
+        ↓
+模型继续下一步
+```
+
+当前生产策略同时配置：
+
+```text
+required = true
+startup_timeout_sec = 10
+tool_timeout_sec = 30
+output_token_limit = 1024
+```
+
+其中 `output_token_limit` 很重要：企业 Tool 可能返回巨大 JSON，不能无限塞入模型 Context。
+
+Java 侧只暴露语义明确的 MCP Tool：
 
 ```text
 get_order_status
 cancel_order
-request_refund
-create_invoice_draft
 ```
 
-不推荐直接暴露：
-
-```text
-execute_sql
-generic_crud
-update_table
-```
-
-真实项目更推荐：
-
-```text
-Java Business Service
-        ↑
-Agent MCP Adapter
-```
-
-当前订单 Tool 策略：
-
-```text
-get_order_status → approval_mode=approve
-cancel_order     → approval_mode=prompt
-```
+MCP Adapter 再调用真实 Order Backend。模型不会直接访问数据库。
 
 ---
 
-# 6. Approval：高风险动作谁来决定
+# 6. Approval 在 Codex 里到底是什么
 
-三个概念不要混：
+`cancel_order` 配置：
 
 ```text
-approval_policy
-→ 是否允许产生审批请求
+approval_mode = prompt
+```
 
-approvals_reviewer
-→ 审批发生后交给谁判断
+当 Codex Harness 准备调用该 Tool 时，它不会直接执行，而会触发 App Server 的 Server Request：
 
+```text
+mcpServer/elicitation/request
+meta.codex_approval_kind = mcp_tool_call
+```
+
+Thread 配置：
+
+```text
+approval_policy = on-request
+approvals_reviewer = user
+```
+
+因此审批不是交给 `auto_review`，而是路由回宿主应用。
+
+当前链路：
+
+```text
+Codex 想调用 cancel_order
+        ↓
+Codex 发 Approval Server Request
+        ↓
 approval_handler
-→ 宿主程序怎么接住审批请求
-```
-
-当前 Human-in-the-loop 使用：
-
-```text
-approval_policy = on_request
-approvals_reviewer = ApprovalsReviewer.user
-```
-
-含义：
-
-```text
-需要审批
-→ 不交给 Codex auto reviewer
-→ 交还给宿主应用
-→ ApprovalService
-→ ApprovalStore
-→ 人工 approve / reject
-```
-
-`cancel_order` 链路：
-
-```text
-用户要求取消订单
- ↓
-Agent 决定调用 cancel_order
- ↓
-approval_mode=prompt
- ↓
-MCP Tool Approval
- ↓
-approvals_reviewer=user
- ↓
+        ↓
 ApprovalService
- ↓
+        ↓
+Redis Approval Repository
+        ↓
 PENDING
- ↓
+        ↓
 人工 approve / reject
- ↓
-accept / decline
- ↓
-Codex 决定是否真正执行 Tool
+        ↓
+accept / decline 返回 Codex
+        ↓
+Codex 继续或停止 Tool Call
 ```
 
-当前 ApprovalStore 是学习用内存实现；生产环境应使用 DB / Redis + Approval Center。
+关键状态已从进程内存迁移到 Redis，因此多个 Agent Service 实例可以共享审批记录和决策信号。
+
+Approval 仍然 **不等于业务授权**。真实 Order Backend 必须最终检查 actor、tenant、角色、订单归属和订单状态。
 
 ---
 
-# 7. Approval 不等于 Business Authorization
+# 7. Sandbox 在 Codex 里到底是什么
 
-即使 Approval 已经通过，Java Business System 仍然必须独立检查：
+Sandbox 不是一句 Prompt：
 
 ```text
-userId
-role
-tenantId
-订单归属
-订单状态
-金额阈值
-业务规则
+“请不要修改文件”
 ```
 
-所以：
+它是 Codex Runtime 的执行策略。
+
+Order Agent 使用：
 
 ```text
-Codex Approval
-≠
-Business Authorization
+Sandbox.read_only
+```
+
+因为订单 Agent 只需要读 Skill / workspace，本地没有修改文件的业务理由。
+
+所以即使模型尝试本地写文件，Runtime 仍会阻止；但 `cancel_order` 仍可在 Approval 通过后通过 MCP 修改真实业务，因为两条执行路径不同：
+
+```text
+本地文件操作
+→ Sandbox
+
+真实订单操作
+→ MCP → Approval → Business Authorization
+```
+
+因此：
+
+```text
+Sandbox != MCP Permission != Approval != Business Authorization
 ```
 
 ---
 
-# 8. Event / Streaming / Observability
+# 8. Event / Streaming 在 Codex 里到底是什么
 
-## 8.1 Event
-
-App Server 是事件驱动的，一个 Turn 中会出现：
+App Server 本身会持续产生 Notification，例如：
 
 ```text
 turn/started
@@ -399,29 +291,25 @@ item/agentMessage/delta
 turn/completed
 ```
 
-Event 是结构化运行事实，不等同于普通文本 Log。
-
-## 8.2 Streaming
-
-流式链路使用官方 SDK：
+官方 Python SDK 已经提供：
 
 ```python
-turn = await thread.turn(
-    message,
-    sandbox=Sandbox.read_only,
-)
-
+turn = await thread.turn(...)
 async for notification in turn.stream():
     ...
 ```
 
-SSE API：
+我们不重新实现 stdout Reader Loop，而是在 Runtime Adapter 上增加 `CodexEventMapper`：
 
-```http
-POST /api/v1/agents/threads/{thread_id}/turns/stream
+```text
+Codex Raw Notification
+        ↓
+CodexEventMapper
+        ↓
+AgentEvent
 ```
 
-前端可实时收到：
+这样前端只依赖稳定平台事件：
 
 ```text
 turn.started
@@ -431,692 +319,273 @@ message.delta
 turn.completed
 ```
 
-## 8.3 为什么不把 Raw Notification 直接给前端
+reasoning、完整 Tool 参数、完整 Tool Result 等敏感底层数据不直接暴露给产品前端。
 
-当前使用 `CodexEventMapper`：
-
-```text
-Codex Raw Notification
-        ↓
-CodexEventMapper
-        ↓
-AgentEvent
-        ↓
-SSE / OpenTelemetry
-```
-
-默认不直接透传：
-
-```text
-reasoning 事件
-完整 Tool arguments
-完整 Tool result
-敏感文件内容
-```
-
-这样既避免前端绑定 Codex 私有协议，也降低敏感信息泄漏风险。
-
-## 8.4 Observability 不自研平台
-
-项目不自己开发 Trace UI / Timeline / Dashboard，而是：
-
-```text
-CodexRuntime
- ↓
-OpenTelemetry
- ↓
-OTLP
- ↓
-Langfuse / Phoenix / Tempo / 其他 OTLP Backend
-```
-
-`.env.example`：
-
-```text
-OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=
-```
-
-留空时本地不发送远程 Trace。
+SSE 用于用户实时体验；OpenTelemetry 用于 Trace。Observability 平台不自研，可以接 Langfuse、Phoenix、Tempo 等 OTLP 后端。
 
 ---
 
-# 9. Sandbox：Runtime 真正的执行边界
+# 9. Context / Compaction 在 Codex 里到底是什么
 
-Sandbox 回答：
+Thread 是持续会话状态，但 Thread 历史不等于下一轮模型请求的 Effective Context。
 
-> 即使模型想做、甚至某次 Approval 已经批准，Runtime 实际最多允许它访问和修改哪些本地资源？
-
-官方 Python SDK 提供：
-
-```python
-Sandbox.read_only
-Sandbox.workspace_write
-Sandbox.full_access
-```
-
-简单理解：
+Codex Harness 会管理：
 
 ```text
-read_only
-→ 可读文件，不允许写
-
-workspace_write
-→ 可读，并允许写 workspace / configured writable roots
-
-full_access
-→ 取消 Codex 文件系统 Sandbox 的主要限制
-→ 底层对应 danger-full-access
-```
-
-生产环境应遵循最小权限原则。
-
----
-
-# 10. Sandbox 与 Approval 的区别
-
-```text
-Approval
-= 人/策略对某一次动作做逻辑授权
-
-Sandbox
-= Runtime 对执行环境做强制限制
-```
-
-类比公司门禁：
-
-```text
-Approval
-→ 领导同意你今天进入机房
-
-Sandbox
-→ 你的门禁卡实际只允许进入 A 区和 B 区
-```
-
-二者是叠加关系，不是替代关系。
-
----
-
-# 11. 当前订单 Agent 为什么使用 read_only
-
-订单 Agent 的本地职责主要是：
-
-```text
-读取 Skill
-读取必要 workspace 信息
-模型推理
-调用 MCP Tool
-```
-
-它不需要修改本地源码或创建文件，因此当前显式使用：
-
-```text
-Sandbox.read_only
-```
-
-Thread 创建：
-
-```python
-params = ThreadStartParams(
-    approval_policy=...,
-    approvals_reviewer=ApprovalsReviewer.user,
-    sandbox=SandboxMode.read_only,
-    cwd=str(self._workspace),
-)
-```
-
-普通 Turn：
-
-```python
-result = await thread.run(
-    message,
-    sandbox=Sandbox.read_only,
-)
-```
-
-流式 Turn：
-
-```python
-turn = await thread.turn(
-    message,
-    sandbox=Sandbox.read_only,
-)
-```
-
-OpenTelemetry Span 中也记录：
-
-```text
-agent.sandbox = read-only
-```
-
----
-
-# 12. read_only 为什么仍然可以 cancel_order
-
-`Sandbox.read_only` 主要限制 Codex Runtime 的本地执行环境。
-
-`cancel_order` 走的是：
-
-```text
-Codex Harness
- ↓
-MCP
- ↓
-Approval
- ↓
-Java Business System
- ↓
-Business Authorization
- ↓
-OrderService
-```
-
-所以可以出现：
-
-```text
-本地文件：只读
-真实订单：审批 + Java 权限通过后可以修改
-```
-
-因此：
-
-```text
-Sandbox
-≠ MCP Tool Permission
-≠ Approval
-≠ Business Authorization
-```
-
-详细实验见：
-
-```text
-docs/sandbox.md
-```
-
----
-
-# 13. Context：模型这一轮真正拿来工作的内容
-
-这是 Context 阶段最重要的概念：
-
-```text
-Thread
-= 整个会话发生过什么
-
-Context
-= 当前这一轮真正送给模型、用于推理的工作集
-```
-
-所以：
-
-```text
-Thread 历史很长
-≠
-下一轮一定把全部原始历史 100% 原样送给模型
-```
-
-模型的 Context Window 是有限的，因此 Harness 必须管理有效上下文。
-
-概念上一次模型调用可能包含：
-
-```text
-System / Developer Instructions
-Skill / 当前规则
-压缩后的历史摘要
-最近几轮消息
-必要 Tool Result
-当前用户输入
-```
-
-而不是无限增长的全部原始记录。
-
----
-
-# 14. Thread History 与 Effective Context 要分开
-
-可以把它类比成数据库：
-
-```text
-conversation_history 表
-→ 保存了 1000 条历史记录
-```
-
-并不意味着每次模型请求都：
-
-```text
-SELECT * FROM conversation_history
-```
-
-然后全部塞给模型。
-
-更合理的是：
-
-```text
-Persistent Thread History
-        ↓
-Context Manager / Harness
-        ↓
-保留 / 裁剪 / Compact
-        ↓
-Effective Context
-        ↓
+Thread History
+      ↓
+Context Manager
+      ↓
+有效工作上下文
+      ↓
 Model
 ```
 
-因此企业架构中要区分：
-
-```text
-Audit / Persistent History
-≠
-Model Context
-```
-
-完整 Tool Result 可能为了审计长期保存，但模型后续并不需要每轮都看到巨大原始 JSON。
-
----
-
-# 15. Compaction：长会话怎么继续运行
-
-当 Thread 持续很多轮后，Context Token 会越来越大。
-
-Compaction 的目的不是简单“忘掉旧聊天”，而是：
-
-```text
-旧历史
- ↓
-提炼关键事实 / 决策 / 当前任务状态
- ↓
-生成 summary
- ↓
-构造 compacted / replacement history
- ↓
-用更短的 Effective Context 继续工作
-```
-
-可以理解成：
-
-```text
-History Replacement
-而不是
-History Forget
-```
-
-例如大量原始历史：
-
-```text
-用户查询订单1001
-Tool 返回 SHIPPED
-继续讨论送达时间
-继续讨论延迟
-继续讨论取消
-...
-```
-
-Compact 后可能保留成：
-
-```text
-此前会话摘要：
-- 当前处理订单1001
-- 已确认状态 SHIPPED
-- 用户讨论过延迟问题
-- 用户考虑取消订单
-- cancel_order 属于需要人工审批的写操作
-```
-
-后续模型依赖摘要 + 最近上下文继续工作。
-
----
-
-# 16. Context Window 与自动 Compaction
-
-Codex 配置层有两个重要概念：
-
-```text
-model_context_window
-→ 模型上下文窗口大小
-
-model_auto_compact_token_limit
-→ Token 使用达到阈值时触发自动 Compaction
-```
-
-不能等 Context 100% 塞满才压缩，因为还需要为：
-
-```text
-当前用户输入
-Tool Result
-模型生成
-后续推理
-```
-
-留空间。
-
-概念上：
-
-```text
-总 Context Window
-████████████████████
-
-历史增长到阈值
-██████████████░░░░░░
-              ↑
-        Auto Compact
-```
-
-Harness 的价值之一就是让长时间 Agent 不因为历史无限膨胀直接失效。
-
----
-
-# 17. Compaction 不等于 RAG，也不等于全局 Memory
-
-三者解决的问题完全不同。
-
-```text
-Compaction
-→ 当前 Thread 太长怎么办
-→ 管理 Conversation Context
-
-RAG
-→ 外部大量知识怎么按需检索
-→ 合同库、知识库、客户资料等
-
-Global Memory
-→ 跨 Thread 的长期用户/业务记忆怎么管理
-```
-
-所以：
-
-```text
-Compaction ≠ RAG
-Compaction ≠ Vector DB
-Thread Context ≠ 全局 Memory
-```
-
----
-
-# 18. Tool Result 为什么容易撑爆 Context
-
-企业 Tool 很可能一次返回大量内容：
-
-```text
-search_contracts
-→ 几百 KB / 几 MB JSON
-```
-
-如果每次都把完整 Tool Result 永久带进模型 Context，会快速消耗 Context Window。
-
-成熟 Harness 通常会组合：
-
-```text
-Tool Result Truncation
-Tool Result Eviction
-Compaction
-```
-
-因此：
-
-```text
-运行轨迹 / 审计数据
-可以完整保存
-
-模型工作 Context
-应该只保留真正需要的内容
-```
-
----
-
-# 19. 当前新增 Thread Read API
-
-为了观察 Thread 与 Context 的区别，项目新增：
-
-```http
-GET /api/v1/agents/threads/{thread_id}
-```
-
-内部使用：
-
-```python
-thread = await self._codex.thread_resume(thread_id)
-response = await thread.read(include_turns=True)
-```
-
-它返回的是 **Thread 快照 / Turn 历史**。
-
-注意：
-
-> 这个接口看到的 Thread 历史，不代表下一轮模型一定会把这些内容全部原样作为 Effective Context。
-
-这正是我们做这个实验的目的。
-
----
-
-# 20. 当前新增 Manual Compact API
-
-新增：
-
-```http
-POST /api/v1/agents/threads/{thread_id}/compact
-```
-
-内部：
-
-```python
-thread = await self._codex.thread_resume(thread_id)
-await thread.compact()
-```
-
-底层对应：
+当上下文增长接近阈值时，Codex Core 可以自动 Compaction；也支持：
 
 ```text
 thread/compact/start
 ```
 
-因此 API 返回：
+当前 API 暴露手动 compact，但我们没有自己写摘要算法，因为这是 Harness 的职责。
 
-```json
+Compaction 的本质是用压缩后的 summary / replacement history 继续会话，而不是把所有历史永久原样塞进模型。
+
+这与 RAG 不同：
+
+```text
+Compaction = 管理当前 Conversation 的上下文
+RAG        = 从外部知识库按需检索
+```
+
+---
+
+# 10. Conversation 为什么不能直接等于 Codex Thread ID
+
+Codex `thread_id` 是 Runtime-specific ID，不应该成为企业业务主键。
+
+现在对外使用：
+
+```text
+conversation_id
+```
+
+Redis 中保存映射：
+
+```text
+conversation_id
+→ agent_id
+→ runtime = codex
+→ runtime_thread_id
+```
+
+因此 API 调用方完全不知道 Codex Thread ID。
+
+意义在于未来可以：
+
+```text
+conversation_id = C001
+
+今天：runtime=codex, runtime_thread_id=xxx
+以后：runtime=other, runtime_thread_id=yyy
+```
+
+业务 API 不需要跟着 Runtime 重写。
+
+---
+
+# 11. 一个真实订单场景怎么跑
+
+员工在业务系统输入：
+
+```text
+“检查订单 A123。如果还没发货就帮我取消；已经发货就不要取消。”
+```
+
+完整执行链：
+
+```text
+1. Business UI 调 Order Agent Conversation
+2. Agent Service 解析 conversation_id → Codex thread_id
+3. Codex Thread 从 workspace 发现 order-analysis Skill
+4. Skill 要求不得猜实时订单状态
+5. Codex 模型选择 get_order_status
+6. Harness 调 order MCP Server
+7. Java Order MCP Adapter 调真实 Order Backend
+8. 返回真实状态
+9. 如果未发货，模型选择 cancel_order
+10. Codex 发现 cancel_order=prompt
+11. Harness 产生 Approval Server Request
+12. Approval 持久化 Redis，等待员工审批
+13. 员工 approve
+14. Codex 恢复 Tool Call
+15. Java MCP Adapter 调真实 Order Backend
+16. Order Backend 做最终 RBAC/ABAC/tenant/order-state 校验
+17. Codex 收到结果并继续生成答案
+18. 全程 Event → SSE；Trace → OpenTelemetry
+19. 长会话 Context 过大时由 Codex Compaction 管理
+```
+
+这就是为什么每一层都存在：不是为了把架构变复杂，而是避免“模型一句话直接改数据库”这种不可治理的系统。
+
+---
+
+# 12. 当前项目到底算什么
+
+当前已经可以拆成：
+
+```text
+Agent Runtime Kernel
+├── Conversation abstraction
+├── Redis persistence boundary
+├── Approval infrastructure
+├── Event protocol
+├── Observability boundary
+└── Runtime lifecycle
+
+CodexRuntime Adapter
+├── Thread / Turn
+├── Skill readiness
+├── MCP config compilation
+├── Human Approval bridge
+├── Sandbox
+├── Event streaming
+└── Context / Compaction
+
+Order Agent Definition
+├── order-analysis Skill
+├── order MCP server
+├── Tool policies
+└── read-only Sandbox
+
+Order MCP Adapter
+└── Real Order Backend integration
+```
+
+所以它已经是“**通用 Runtime 内核的第一版**”，但还不是完整企业 Agent Gateway。
+
+完整 Gateway 仍应增加：
+
+```text
+Authentication / Trusted Actor Context
+Tenant isolation
+Agent Registry
+Multiple Runtime adapters
+Runtime routing / sticky routing
+Rate limit / quota
+Central policy
+Audit storage
+Secret management
+Deployment HA
+```
+
+特别是 actor / tenant 身份不能作为模型可编辑的 Tool 参数。未来 Gateway 必须把可信身份作为调用上下文传给 MCP / Business Backend；当前仓库不使用假 `userId` 来掩盖这个尚未实现的安全边界。
+
+---
+
+# 13. 生产配置
+
+Agent Service 必填：
+
+```text
+ORDER_MCP_URL
+REDIS_URL
+```
+
+可选：
+
+```text
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+OTEL_EXPORTER_OTLP_HEADERS
+```
+
+Order MCP Adapter 必填：
+
+```text
+ORDER_BACKEND_BASE_URL
+```
+
+仓库中不包含固定订单、固定审批结果、进程内审批状态或本地假业务数据库。
+
+---
+
+# 14. API 契约
+
+创建业务 Conversation：
+
+```http
+POST /api/v1/agents/order/conversations
+```
+
+执行 Turn：
+
+```http
+POST /api/v1/agents/order/conversations/{conversation_id}/turns
+Content-Type: application/json
+
 {
-  "thread_id": "...",
-  "status": "COMPACTION_STARTED"
+  "message": "查询订单 A123 的真实状态"
 }
 ```
 
-这里故意不返回 `COMPLETED`，因为官方接口语义是“启动一次 Compaction”，不是我们自己伪造一个同步完成状态。
-
----
-
-# 21. Context / Compaction 实验
-
-建议使用同一个 Thread 连续执行多轮。
-
-第一轮：
-
-```text
-请记住：这个测试项目代号叫“北极星”，负责人叫小李。
-```
-
-第二轮：
-
-```text
-订单1001是什么状态？
-```
-
-第三轮：
-
-```text
-请再次告诉我项目代号和负责人。
-```
-
-然后读取 Thread：
+流式 Turn：
 
 ```http
-GET /api/v1/agents/threads/{thread_id}
+POST /api/v1/agents/order/conversations/{conversation_id}/turns/stream
 ```
 
-再触发：
+读取 Runtime 状态：
 
 ```http
-POST /api/v1/agents/threads/{thread_id}/compact
+GET /api/v1/agents/order/conversations/{conversation_id}
 ```
 
-之后继续同一个 Thread：
+触发 Compaction：
 
-```text
-我们之前约定的项目代号和负责人是什么？
+```http
+POST /api/v1/agents/order/conversations/{conversation_id}/compact
 ```
 
-观察关键事实是否继续保留。
+Approval：
 
-这个实验要理解的是：
-
-```text
-Thread 仍然是同一个 Thread
- ↓
-历史可能发生 Compaction
- ↓
-模型工作 Context 变短
- ↓
-关键状态仍应尽量被摘要保留
-```
-
----
-
-# 22. 当前完整订单 Agent 安全模型
-
-```text
-Order Agent
-│
-├── Skill
-│   └── order-analysis
-│
-├── MCP Tools
-│   ├── get_order_status → auto
-│   └── cancel_order → prompt
-│
-├── Approval
-│   └── Human-in-the-loop
-│
-├── Sandbox
-│   └── read_only
-│
-├── Event / Streaming
-│   └── SSE
-│
-├── Observability
-│   └── OpenTelemetry / OTLP
-│
-├── Context
-│   └── Thread + Effective Context
-│
-├── Compaction
-│   └── Auto + Manual
-│
-└── Java Business System
-    └── Final Authorization
-```
-
----
-
-# 23. 本地 / Codespaces 联调
-
-Java：
-
-```bash
-cd hanress-test
-mvn spring-boot:run
-```
-
-Python：
-
-```bash
-cd codex-agent-python
-source .venv/bin/activate
-pip install -e ".[dev]"
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-Swagger：
-
-```text
-http://127.0.0.1:8000/docs
-```
-
-当前主要 API：
-
-```text
-POST /api/v1/agents/threads
-GET  /api/v1/agents/threads/{thread_id}
-POST /api/v1/agents/threads/{thread_id}/compact
-POST /api/v1/agents/threads/{thread_id}/turns
-POST /api/v1/agents/threads/{thread_id}/turns/stream
-
+```http
 GET  /api/v1/approvals
 POST /api/v1/approvals/{approval_id}/approve
 POST /api/v1/approvals/{approval_id}/reject
 ```
 
----
-
-# 24. 当前学习进度
-
-已完成：
-
-```text
-Thread / Turn                 ✅
-Skill                         ✅
-MCP / Tool                    ✅
-Approval / Human-in-the-loop  ✅
-Event                         ✅
-Streaming / SSE               ✅
-OpenTelemetry Observability   ✅
-Sandbox                       ✅
-```
-
-当前阶段：
-
-```text
-Context / Compaction          ← 进行中
-```
-
-后续：
-
-```text
-Thread persistence / resume
-→ 多实例
-→ Agent Gateway
-```
+生产部署时，这些管理接口必须置于真实认证授权网关之后。
 
 ---
 
-# 25. 最终记忆版
+# 15. 最终心智模型
 
 ```text
-Thread
-= 会话历史容器
-
-Context
-= 模型当前工作集
-
-Compaction
-= 长会话上下文压缩机制
-
-Skill
-= 怎么做
-
-MCP Tool
-= 能做什么
-
-Approval
-= 这一次能不能做
-
-Sandbox
-= 本地执行环境最多能碰哪里
-
-Event
-= Agent 做到哪了
-
-OpenTelemetry
-= 如何把运行数据交给专业观测平台
-
+业务需求 / Agent Definition
+          │
+          ▼
+Enterprise Runtime Kernel
+          │
+          ▼
+CodexRuntime Adapter
+          │
+          ▼
+Codex Harness
+          │
+  ┌───────┼────────────────────────────┐
+  │       │        │       │           │
+Skill    MCP    Approval Sandbox   Context/Event
+  │       │        │       │           │
+  └───────┴────────┴───────┴───────────┘
+          │
+          ▼
+Governed Business Capability
+          │
+          ▼
 Business Authorization
-= 真实业务最终权限边界
+          │
+          ▼
+Real Business System
 ```
 
-这就是当前项目逐步构建企业 Agent Service 的核心路线。
+**我们开发的意义不是再造 Harness，而是把 Harness 变成企业系统可以安全接入、可替换、可治理的 Runtime。**
