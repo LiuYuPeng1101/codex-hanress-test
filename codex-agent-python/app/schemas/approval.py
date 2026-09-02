@@ -1,22 +1,27 @@
 from datetime import datetime
-from typing import Any
 
 from pydantic import BaseModel
 
 
 class ApprovalResponse(BaseModel):
-    """审批记录响应。"""
+    """企业审批页面使用的安全字段。
+
+    Codex 原始 params、runtime thread/turn ID 只保存在数据库与受控审计链路中，
+    不作为普通审批 API 的对外契约。
+    """
 
     id: str
-    method: str
-    params: dict[str, Any]
+    conversation_id: str
+    requester_user_id: str
+    tenant_id: str
+    server_name: str | None
+    message: str
     status: str
     created_at: datetime
     decided_at: datetime | None
     decision: str | None
+    decided_by: str | None
 
 
 class ApprovalListResponse(BaseModel):
-    """待审批/历史审批列表。"""
-
     items: list[ApprovalResponse]

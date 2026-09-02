@@ -1,113 +1,115 @@
-# Python Codex 人工审批实验
+# Codex MCP Tool Approval
 
-这一阶段演示：查询类 MCP Tool 自动执行，写操作 MCP Tool 必须等待人工审批。
-
-## 当前策略
+当前策略：
 
 ```text
 get_order_status
-→ approval_mode = approve
+→ approval_mode=approve
 → 自动执行
 
 cancel_order
-→ approval_mode = prompt
-→ 产生 MCP Tool Approval
-→ 等待人工 approve / reject
+→ approval_mode=prompt
+→ Human-in-the-loop
 ```
 
-## 执行链
+## Codex 侧执行链
 
 ```text
-用户：取消订单1001
-        ↓
 Codex Harness
-        ↓
+ ↓
 cancel_order
-        ↓
+ ↓
 approval_mode=prompt
-        ↓
+ ↓
 mcpServer/elicitation/request
-        ↓
+ ↓
+meta.codex_approval_kind=mcp_tool_call
+ ↓
 ApprovalService
-        ↓
-ApprovalStore 创建 PENDING
-        ↓
-原 Turn 等待
+ ↓
+PostgreSQL approval_requests
+ ↓
+PENDING
+ ↓
+人工 approve / reject
+ ↓
+accept / decline
+ ↓
+Codex 决定是否真正调用 MCP Tool
 ```
 
-此时另一个 HTTP 请求仍可访问：
-
-```http
-GET /api/v1/approvals
-```
-
-找到 `status=PENDING` 的审批 ID 后，可以批准：
+批准：
 
 ```http
 POST /api/v1/approvals/{approval_id}/approve
 ```
 
-或者拒绝：
+拒绝：
 
 ```http
 POST /api/v1/approvals/{approval_id}/reject
 ```
 
-批准后：
+## 持久化原则
+
+审批记录使用 PostgreSQL 作为事实来源，不使用进程内 Map / Event 保存业务状态。
+
+数据库迁移：
 
 ```text
-ApprovalStore
-→ 唤醒 approval handler
-→ {action: accept, content: {}}
-→ Codex Harness
-→ 真正调用 Java MCP cancel_order
-→ Turn 继续完成
+migrations/001_create_approval_requests.sql
 ```
 
-拒绝后：
+决策更新必须满足：
 
 ```text
-ApprovalStore
-→ {action: decline, content: null}
-→ cancel_order 不执行
-→ Agent 根据拒绝结果继续生成回答
+WHERE status = PENDING
 ```
 
-## 为什么当前使用内存 Store
+避免多个实例或重复请求覆盖已经完成的审批。
 
-这是学习版本，重点是理解 Human-in-the-loop 的运行机制。
+超过 `APPROVAL_TIMEOUT_SECONDS` 仍未得到决策时，审批转为 `EXPIRED` 并向 Codex 返回 `decline`。
 
-生产环境应该把 ApprovalStore 替换为数据库/Redis，并增加：
+## 多实例边界
 
-- userId / tenantId
-- agentId / conversationId / threadId / turnId
-- toolName / toolArguments
-- 风险等级
-- 审批人
-- 审批理由
-- 超时
-- 审计日志
-- 多实例消息通知
+数据库持久化可以让多个 Agent Service 实例共享审批记录，但不能单独解决“活跃 Turn 所属 Runtime 实例死亡”的问题。
 
-## 重要安全边界
-
-Codex Approval 不是业务授权。
-
-即使 Agent Approval 已批准，Java 业务系统仍然必须独立校验：
-
-- 当前用户身份
-- RBAC / ABAC
-- tenant
-- 是否拥有该订单
-- 当前订单状态是否允许取消
-- 金额/风险阈值
-
-最终推荐链路：
+活跃 Codex Turn 仍然属于运行它的 Runtime / App Server 进程。生产集群还需要：
 
 ```text
-Agent
-→ Codex Permission / Approval
-→ MCP
-→ Java Business Authorization
-→ Business Service
+runtime_instance_id
+Thread ownership / lease
+Runtime routing
+失败实例检测
+可恢复 Run 状态
+```
+
+这些属于后续 Agent Gateway / 多实例 Runtime 控制面。
+
+## Approval 不是业务授权
+
+即使 Codex Approval 已经通过，真实业务系统仍然必须校验：
+
+```text
+认证用户
+Tenant
+RBAC / ABAC
+订单归属
+订单状态
+金额 / 风险阈值
+业务规则
+```
+
+推荐链路：
+
+```text
+Agent Policy / Approval
+ ↓
+MCP
+ ↓
+Trusted Identity Context
+ ↓
+Business Authorization
+ ↓
+Business Service
 ```

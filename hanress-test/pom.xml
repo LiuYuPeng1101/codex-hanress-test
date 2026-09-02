@@ -14,10 +14,10 @@
     </parent>
 
     <groupId>com.example</groupId>
-    <artifactId>hanress-test</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
-    <name>hanress-test</name>
-    <description>Codex Harness + Spring Boot integration sample</description>
+    <artifactId>order-mcp-adapter</artifactId>
+    <version>0.1.0</version>
+    <name>order-mcp-adapter</name>
+    <description>企业订单系统的 Spring AI MCP Adapter</description>
 
     <properties>
         <java.version>21</java.version>

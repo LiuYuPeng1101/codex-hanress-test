@@ -1,6 +1,6 @@
 spring:
   application:
-    name: hanress-test
+    name: order-mcp-adapter
   ai:
     mcp:
       server:
@@ -11,22 +11,14 @@ spring:
         streamable-http:
           mcp-endpoint: /mcp
 
-codex:
-  runtime:
-    # 本地开发：默认从系统 PATH 中查找 codex 可执行文件。
-    # Docker / Linux 生产环境：如有需要，可设置 CODEX_EXECUTABLE=/usr/local/bin/codex。
-    executable: ${CODEX_EXECUTABLE:codex}
-    startup-timeout: 30s
+mcp:
+  security:
+    # Agent Runtime -> MCP Adapter 的服务认证密钥，必须由 Secret Manager 注入。
+    service-token: ${MCP_SERVICE_TOKEN}
 
-agent:
-  approval:
-    # 学习阶段用于模拟人工审批：accept / decline / cancel。
-    # 安全起见默认 decline。生产环境应替换为数据库 + 前端审批中心，而不是自动同意。
-    default-decision: ${AGENT_APPROVAL_DEFAULT_DECISION:decline}
-  definitions:
-    order:
-      # 部署环境建议通过环境变量注入；本地开发使用 "." 可以保持项目路径可移植。
-      # Codex 会从 <workspace>/.agents/skills 中发现当前 Agent 的项目级 Skill。
-      workspace: ${AGENT_ORDER_WORKSPACE:.}
-      required-skills:
-        - order-analysis
+order-service:
+  # 真实订单系统地址和服务凭据必须由部署环境注入，不允许使用内存数据或测试订单兜底。
+  base-url: ${ORDER_SERVICE_BASE_URL}
+  service-token: ${ORDER_SERVICE_TOKEN}
+  status-path: ${ORDER_STATUS_PATH:/api/orders/{orderId}/status}
+  cancel-path: ${ORDER_CANCEL_PATH:/api/orders/{orderId}/cancel}

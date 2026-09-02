@@ -1,4 +1,5 @@
 import json
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Callable
@@ -12,177 +13,183 @@ from openai_codex.generated.v2_all import (
     ThreadStartParams,
 )
 
+from app.agents.definition import AgentDefinition, SandboxPolicy
 from app.events.codex_event_mapper import CodexEventMapper
 from app.events.models import AgentEvent
 from app.observability.tracing import get_tracer
 
 
 class CodexRuntime:
-    """对官方 OpenAI Codex Python SDK 的轻量封装。
+    """把企业 AgentDefinition 适配到官方 Codex Harness。
 
-    这一层只负责 Codex Runtime 能力，不放具体订单、财务、合同业务逻辑。
-    FastAPI 启动时创建一份 Runtime，应用关闭时统一释放。
-
-    当前订单 Agent 使用：
-    - Java MCP Server 提供真实业务能力；
-    - Human Approval 控制高风险写操作；
-    - read-only Sandbox 限制本地执行环境；
-    - Event / SSE / OpenTelemetry 暴露运行过程；
-    - Thread Read / Compaction 用于学习长会话上下文管理。
+    这一层不包含订单、合同、财务等业务名词。它负责把控制面定义翻译成 Codex 的：
+    Thread、MCP 配置、Tool allow-list、Approval Policy、Sandbox、Event 与 Context 生命周期。
     """
 
     def __init__(
         self,
-        workspace: Path,
-        order_mcp_url: str,
+        definition: AgentDefinition,
+        codex_home: Path,
         approval_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
     ) -> None:
-        self._workspace = workspace.resolve()
-        self._order_mcp_url = order_mcp_url
+        self._definition = definition
+        self._workspace = Path(definition.workspace).resolve()
+        self._codex_home = codex_home.resolve()
         self._event_mapper = CodexEventMapper()
         self._tracer = get_tracer()
 
-        # MCP Tool 策略：查询自动执行，取消订单必须进入 Approval。
-        config = CodexConfig(
-            config_overrides=(
-                f"mcp_servers.order.url={json.dumps(order_mcp_url)}",
-                'mcp_servers.order.enabled_tools=["get_order_status","cancel_order"]',
-                'mcp_servers.order.default_tools_approval_mode="approve"',
-                'mcp_servers.order.tools.get_order_status.approval_mode="approve"',
-                'mcp_servers.order.tools.cancel_order.approval_mode="prompt"',
+        self._codex_home.mkdir(parents=True, exist_ok=True)
+        if not os.access(self._codex_home, os.W_OK):
+            raise RuntimeError(f"Codex 持久化目录不可写: {self._codex_home}")
+
+        runtime_env = dict(os.environ)
+        runtime_env["CODEX_HOME"] = str(self._codex_home)
+
+        self._codex = AsyncCodex(
+            config=CodexConfig(
+                env=runtime_env,
+                config_overrides=self._build_mcp_config_overrides(),
             )
         )
 
-        self._codex = AsyncCodex(config=config)
-
-        # 当前官方 AsyncCodex 高层构造器暂未直接暴露 approval_handler。
-        # 这里把 SDK 私有适配限制在 Runtime 内部，不让 API / Service 层依赖内部结构。
+        # 当前高层 AsyncCodex 尚未直接暴露人工 approval handler。
+        # 私有 SDK 适配被严格限制在 Runtime Adapter 内；SDK 升级时只需修改这一处。
         self._codex._client._sync._approval_handler = approval_handler
         self._started = False
 
     @property
-    def workspace(self) -> Path:
-        """返回当前 Agent 的工作目录。"""
-
-        return self._workspace
-
-    @property
-    def order_mcp_url(self) -> str:
-        """返回当前订单 MCP Server 地址。"""
-
-        return self._order_mcp_url
+    def agent_id(self) -> str:
+        return self._definition.agent_id
 
     async def start(self) -> None:
-        """启动 Codex Runtime。"""
-
         if self._started:
             return
         await self._codex.__aenter__()
         self._started = True
 
     async def close(self) -> None:
-        """关闭 Codex Runtime 并释放底层进程资源。"""
-
         if not self._started:
             return
         await self._codex.__aexit__(None, None, None)
         self._started = False
 
-    async def create_thread(self) -> str:
-        """创建使用人工 reviewer + read-only Sandbox 的 Codex Thread。"""
+    async def create_thread(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> str:
+        """创建带人工 reviewer、最小 Sandbox 与可信 MCP 身份的 Codex Thread。"""
 
         self._ensure_started()
         params = ThreadStartParams(
             approval_policy=AskForApproval(root=AskForApprovalValue.on_request),
             approvals_reviewer=ApprovalsReviewer.user,
-            sandbox=SandboxMode.read_only,
+            sandbox=self._sandbox_mode(),
+            config=self._mcp_identity_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
             cwd=str(self._workspace),
         )
         started = await self._codex._client.thread_start(params)
         return started.thread.id
 
-    async def read_thread(self, thread_id: str) -> dict[str, Any]:
-        """读取 Thread 快照，并包含 Turn 历史。
-
-        这里读取的是 Codex 持久化的 Thread/Turn 结构，主要用于学习和诊断。
-        它不等于“下一次模型请求会把这些内容全部原样塞进 Context Window”。
-        """
-
+    async def archive_thread(self, thread_id: str) -> None:
         self._ensure_started()
-        thread: AsyncThread = await self._codex.thread_resume(
+        await self._codex.thread_archive(thread_id)
+
+    async def read_thread(
+        self,
+        thread_id: str,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> dict[str, Any]:
+        thread = await self._resume_thread(
             thread_id,
-            cwd=str(self._workspace),
+            user_id=user_id,
+            tenant_id=tenant_id,
+            roles=roles,
         )
         response = await thread.read(include_turns=True)
         return response.model_dump(by_alias=True, mode="json")
 
-    async def compact_thread(self, thread_id: str) -> None:
-        """触发一次手动 Thread Compaction。
-
-        官方接口是 `thread/compact/start`，因此这里的返回只表示已经成功发起压缩，
-        不把“请求已受理”误写成“压缩已经同步完成”。
-        """
-
-        self._ensure_started()
-        thread: AsyncThread = await self._codex.thread_resume(
+    async def compact_thread(
+        self,
+        thread_id: str,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> None:
+        thread = await self._resume_thread(
             thread_id,
-            cwd=str(self._workspace),
+            user_id=user_id,
+            tenant_id=tenant_id,
+            roles=roles,
         )
         await thread.compact()
 
-    async def run_turn(self, thread_id: str, message: str) -> str:
-        """执行一轮非流式 Turn，兼容原有一次性返回最终答案的 API。"""
-
-        self._ensure_started()
+    async def run_turn(
+        self,
+        thread_id: str,
+        conversation_id: str,
+        message: str,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> str:
         with self._tracer.start_as_current_span("agent.turn") as span:
-            span.set_attribute("agent.thread.id", thread_id)
+            self._set_common_span_attributes(span, conversation_id, thread_id, user_id, tenant_id)
             span.set_attribute("agent.streaming", False)
-            span.set_attribute("agent.sandbox", Sandbox.read_only.value)
 
-            thread: AsyncThread = await self._codex.thread_resume(
+            thread = await self._resume_thread(
                 thread_id,
-                cwd=str(self._workspace),
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
             )
-            result = await thread.run(
-                message,
-                sandbox=Sandbox.read_only,
-            )
+            result = await thread.run(message, sandbox=self._sandbox())
 
-            span.set_attribute("agent.turn.id", result.id)
+            span.set_attribute("agent.runtime.turn.id", result.id)
             span.set_attribute("agent.turn.status", str(result.status))
             if result.duration_ms is not None:
                 span.set_attribute("agent.turn.duration_ms", result.duration_ms)
-
             return result.final_response or ""
 
-    async def stream_turn(self, thread_id: str, message: str) -> AsyncIterator[AgentEvent]:
-        """执行一轮流式 Turn，并逐条输出经过安全映射的 AgentEvent。"""
-
-        self._ensure_started()
-        thread: AsyncThread = await self._codex.thread_resume(
+    async def stream_turn(
+        self,
+        thread_id: str,
+        conversation_id: str,
+        message: str,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> AsyncIterator[AgentEvent]:
+        thread = await self._resume_thread(
             thread_id,
-            cwd=str(self._workspace),
+            user_id=user_id,
+            tenant_id=tenant_id,
+            roles=roles,
         )
-        turn = await thread.turn(
-            message,
-            sandbox=Sandbox.read_only,
-        )
+        turn = await thread.turn(message, sandbox=self._sandbox())
 
         with self._tracer.start_as_current_span("agent.turn.stream") as span:
-            span.set_attribute("agent.thread.id", thread_id)
-            span.set_attribute("agent.turn.id", turn.id)
+            self._set_common_span_attributes(span, conversation_id, thread_id, user_id, tenant_id)
+            span.set_attribute("agent.runtime.turn.id", turn.id)
             span.set_attribute("agent.streaming", True)
-            span.set_attribute("agent.sandbox", Sandbox.read_only.value)
 
             async for notification in turn.stream():
-                event = self._event_mapper.map(notification, thread_id, turn.id)
+                event = self._event_mapper.map(notification, conversation_id)
                 if event is None:
                     continue
-
                 attributes: dict[str, str] = {
                     "agent.event.type": event.type,
-                    "agent.thread.id": thread_id,
-                    "agent.turn.id": turn.id,
+                    "agent.conversation.id": conversation_id,
+                    "agent.runtime.thread.id": thread_id,
+                    "agent.runtime.turn.id": turn.id,
                 }
                 tool_name = event.data.get("tool_name")
                 if tool_name:
@@ -190,8 +197,90 @@ class CodexRuntime:
                 span.add_event(event.type, attributes=attributes)
                 yield event
 
-    def _ensure_started(self) -> None:
-        """防止在 FastAPI 生命周期尚未启动完成时调用 Runtime。"""
+    async def _resume_thread(
+        self,
+        thread_id: str,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> AsyncThread:
+        """恢复 Thread 时重新注入当前可信身份，避免长期会话沿用过期角色。"""
 
+        self._ensure_started()
+        return await self._codex.thread_resume(
+            thread_id,
+            cwd=str(self._workspace),
+            sandbox=self._sandbox(),
+            config=self._mcp_identity_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
+        )
+
+    def _build_mcp_config_overrides(self) -> tuple[str, ...]:
+        overrides: list[str] = []
+        for server in self._definition.mcp_servers:
+            prefix = f"mcp_servers.{server.name}"
+            overrides.extend(
+                [
+                    f"{prefix}.url={json.dumps(server.url)}",
+                    f"{prefix}.enabled_tools={json.dumps(list(server.enabled_tools))}",
+                    f"{prefix}.default_tools_approval_mode={json.dumps(server.default_approval_mode)}",
+                ]
+            )
+            for tool_name, approval_mode in server.tool_approval_modes:
+                overrides.append(
+                    f"{prefix}.tools.{tool_name}.approval_mode={json.dumps(approval_mode)}"
+                )
+        return tuple(overrides)
+
+    def _mcp_identity_config(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str,
+        roles: frozenset[str],
+    ) -> dict[str, Any]:
+        """把可信身份放入每个 MCP Server 的 HTTP Header，而不是 Tool 参数。"""
+
+        config: dict[str, Any] = {}
+        for server in self._definition.mcp_servers:
+            config[f"mcp_servers.{server.name}.http_headers"] = {
+                "Authorization": f"Bearer {server.service_token}",
+                "X-User-Id": user_id,
+                "X-Tenant-Id": tenant_id,
+                "X-Roles": ",".join(sorted(roles)),
+            }
+        return config
+
+    def _sandbox(self) -> Sandbox:
+        return {
+            SandboxPolicy.READ_ONLY: Sandbox.read_only,
+            SandboxPolicy.WORKSPACE_WRITE: Sandbox.workspace_write,
+            SandboxPolicy.FULL_ACCESS: Sandbox.full_access,
+        }[self._definition.sandbox]
+
+    def _sandbox_mode(self) -> SandboxMode:
+        return {
+            SandboxPolicy.READ_ONLY: SandboxMode.read_only,
+            SandboxPolicy.WORKSPACE_WRITE: SandboxMode.workspace_write,
+            SandboxPolicy.FULL_ACCESS: SandboxMode.danger_full_access,
+        }[self._definition.sandbox]
+
+    def _set_common_span_attributes(
+        self,
+        span: Any,
+        conversation_id: str,
+        thread_id: str,
+        user_id: str,
+        tenant_id: str,
+    ) -> None:
+        span.set_attribute("agent.id", self._definition.agent_id)
+        span.set_attribute("agent.conversation.id", conversation_id)
+        span.set_attribute("agent.runtime.type", "codex")
+        span.set_attribute("agent.runtime.thread.id", thread_id)
+        span.set_attribute("agent.sandbox", self._sandbox().value)
+        span.set_attribute("enduser.id", user_id)
+        span.set_attribute("tenant.id", tenant_id)
+
+    def _ensure_started(self) -> None:
         if not self._started:
             raise RuntimeError("Codex Runtime 尚未启动")

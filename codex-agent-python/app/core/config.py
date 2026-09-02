@@ -1,27 +1,36 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """应用配置。
+    """Agent Service 生产运行配置。
 
-    FastAPI 项目中建议把环境变量读取集中在一个配置对象中，
-    不要在业务代码里到处直接读取 os.environ。
+    关键依赖必须显式配置；缺失配置时启动失败，不使用虚假数据或隐式降级。
     """
 
     app_name: str = "Codex Agent Service"
-    app_env: str = "dev"
+    app_env: str = "production"
     api_prefix: str = "/api/v1"
     agent_workspace: Path = Path(".")
+    agent_id: str = "order-agent"
+    runtime_instance_id: str = Field(description="当前 Runtime 实例唯一标识，用于 Thread 路由")
+    codex_home: Path = Field(description="Codex 持久化目录；生产环境必须挂载持久卷")
 
-    # Java 业务系统暴露的 MCP Server 地址。
-    # 本地同机运行时默认连接 127.0.0.1:8080；Docker 或跨主机部署时通过环境变量覆盖。
-    order_mcp_url: str = "http://127.0.0.1:8080/mcp"
+    order_mcp_url: str = Field(description="订单 MCP Adapter 地址")
+    order_mcp_service_token: str = Field(
+        min_length=32,
+        description="Agent Runtime 调用订单 MCP Adapter 的服务认证密钥",
+    )
+    database_url: str = Field(description="PostgreSQL 连接串")
+    gateway_shared_secret: str = Field(
+        min_length=32,
+        description="企业 Gateway 调用 Agent Service 的服务认证密钥",
+    )
+    approval_timeout_seconds: int = Field(default=900, ge=30, le=86400)
 
-    # OpenTelemetry OTLP HTTP Trace Endpoint。
-    # 为空时不启用远程 Trace exporter；可配置为 Langfuse / Phoenix / Tempo 等 OTLP 后端。
     otel_exporter_otlp_traces_endpoint: str | None = None
 
     model_config = SettingsConfigDict(
@@ -33,6 +42,4 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """返回单例配置对象，避免每次请求重复解析环境变量。"""
-
     return Settings()

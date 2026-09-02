@@ -3,50 +3,62 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.deps import get_approval_service
+from app.approval.approval_repository import ApprovalRequest
 from app.approval.approval_service import ApprovalService
-from app.approval.approval_store import ApprovalRequest
 from app.schemas.approval import ApprovalListResponse, ApprovalResponse
+from app.security.gateway_auth import GatewayPrincipal, require_approval_principal
 
 router = APIRouter(prefix="/approvals", tags=["Approval"])
 
 
 def _to_response(item: ApprovalRequest) -> ApprovalResponse:
-    """把内部审批对象转换成对外 API Response。"""
+    """从内部完整审计记录生成审批页面可见的最小数据集。"""
 
+    message = item.params.get("message")
     return ApprovalResponse(
         id=item.id,
-        method=item.method,
-        params=item.params,
+        conversation_id=item.conversation_id,
+        requester_user_id=item.requester_user_id,
+        tenant_id=item.tenant_id,
+        server_name=item.server_name,
+        message=message if isinstance(message, str) else "Agent 请求执行受控操作",
         status=item.status,
         created_at=item.created_at,
         decided_at=item.decided_at,
         decision=item.decision,
+        decided_by=item.decided_by,
     )
 
 
 @router.get("", response_model=ApprovalListResponse)
-async def list_approvals(
+def list_approvals(
     service: Annotated[ApprovalService, Depends(get_approval_service)],
+    principal: Annotated[GatewayPrincipal, Depends(require_approval_principal)],
 ) -> ApprovalListResponse:
-    """查询审批记录。
-
-    当 cancel_order 触发 MCP Tool Approval 时，会先出现一条 PENDING 记录。
-    """
+    """只返回当前租户审批记录；跨租户审批从查询层即隔离。"""
 
     return ApprovalListResponse(
-        items=[_to_response(item) for item in service.list_approvals()]
+        items=[
+            _to_response(item)
+            for item in service.list_approvals(tenant_id=principal.tenant_id)
+        ]
     )
 
 
 @router.post("/{approval_id}/approve", response_model=ApprovalResponse)
-async def approve(
+def approve(
     approval_id: str,
     service: Annotated[ApprovalService, Depends(get_approval_service)],
+    principal: Annotated[GatewayPrincipal, Depends(require_approval_principal)],
 ) -> ApprovalResponse:
-    """批准本次 Agent 操作，并让等待中的 Codex Turn 继续执行。"""
-
     try:
-        return _to_response(service.approve(approval_id))
+        return _to_response(
+            service.approve(
+                approval_id,
+                user_id=principal.user_id,
+                tenant_id=principal.tenant_id,
+            )
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="审批记录不存在") from exc
     except ValueError as exc:
@@ -54,14 +66,19 @@ async def approve(
 
 
 @router.post("/{approval_id}/reject", response_model=ApprovalResponse)
-async def reject(
+def reject(
     approval_id: str,
     service: Annotated[ApprovalService, Depends(get_approval_service)],
+    principal: Annotated[GatewayPrincipal, Depends(require_approval_principal)],
 ) -> ApprovalResponse:
-    """拒绝本次 Agent 操作，Codex 会收到 decline，Tool 不应真正执行。"""
-
     try:
-        return _to_response(service.reject(approval_id))
+        return _to_response(
+            service.reject(
+                approval_id,
+                user_id=principal.user_id,
+                tenant_id=principal.tenant_id,
+            )
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="审批记录不存在") from exc
     except ValueError as exc:
