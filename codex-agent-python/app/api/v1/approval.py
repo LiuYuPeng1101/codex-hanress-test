@@ -12,16 +12,16 @@ router = APIRouter(prefix="/approvals", tags=["Approval"])
 
 
 def _to_response(item: ApprovalRequest) -> ApprovalResponse:
+    """从内部完整审计记录生成审批页面可见的最小数据集。"""
+
+    message = item.params.get("message")
     return ApprovalResponse(
         id=item.id,
         conversation_id=item.conversation_id,
         requester_user_id=item.requester_user_id,
         tenant_id=item.tenant_id,
-        method=item.method,
-        runtime_thread_id=item.thread_id,
-        runtime_turn_id=item.turn_id,
         server_name=item.server_name,
-        params=item.params,
+        message=message if isinstance(message, str) else "Agent 请求执行受控操作",
         status=item.status,
         created_at=item.created_at,
         decided_at=item.decided_at,
