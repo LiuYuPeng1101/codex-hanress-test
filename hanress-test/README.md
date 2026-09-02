@@ -1,108 +1,133 @@
 # Order MCP Adapter
 
-这个模块是企业订单系统的 **Spring Boot MCP Adapter**。
+这个模块是企业订单系统的 **Spring Boot MCP Adapter**。它不是 Agent Runtime，也不拥有订单事实。
 
-它不运行 Codex，不维护 Agent Thread，不保存审批状态，也不拥有订单业务数据。
-
-职责只有一个：
-
-> 把现有订单系统中的受治理业务能力，以语义明确的 MCP Tool 暴露给 Agent Runtime。
-
-## 架构
+生产职责：
 
 ```text
-Codex Harness
-    │
-    │ MCP
-    ▼
+Codex Runtime
+  │
+  │ Authorization: MCP service credential
+  │ X-User-Id / X-Tenant-Id / X-Roles
+  ▼
+McpServiceAuthenticationFilter
+  ↓
+TrustedMcpRequestContext
+  ↓
+BusinessIdentity
+  ↓
 OrderMcpTools
-    │
-    ▼
+  ↓
 OrderService
-    │
-    ▼
+  ↓
 OrderGateway
-    │
-    ▼
+  ↓
 HttpOrderGateway
-    │
-    ▼
-真实订单系统 / OMS
+  ↓
+真实 OMS / System of Record
 ```
 
-## 为什么这样拆
+## 为什么 Java 只保留 MCP Adapter？
 
-`OrderMcpTools` 是 Agent 协议适配层，只负责：
+Codex Runtime 已统一放在 Python。如果 Java 再启动一份 Codex，会形成两套 Thread、Approval、Event 和 Context 生命周期，因此生产主路径已经删除 Java Codex Runtime。
 
-```text
-Tool 名称
-Tool 描述
-Tool 参数 Schema
-```
+Java 应负责它最擅长的事情：**把已有企业业务能力以受治理的 MCP Tool 暴露出去。**
 
-`OrderService` 是应用服务，不依赖 Codex / MCP。
+## 为什么 Tool 只有 orderId，没有 userId / tenantId？
 
-`OrderGateway` 是业务系统访问端口。
-
-`HttpOrderGateway` 是当前 HTTP 基础设施实现。未来如果订单系统使用 RPC、Dubbo、gRPC、SDK 或其他协议，只替换 Gateway 实现，不修改 Agent Tool 定义。
-
-## 当前 Tool
+当前 Tool：
 
 ```text
 get_order_status(orderId)
 cancel_order(orderId)
 ```
 
-`cancel_order` 是否需要 Human Approval 由上游 Codex Runtime 的 Tool Policy 管理；Java 业务系统仍然必须执行最终授权和业务规则校验。
-
-## 真实业务依赖
-
-部署时必须配置：
+身份不能设计成模型参数：
 
 ```text
+cancel_order(orderId, userId, tenantId, role)  # 错误
+```
+
+因为模型输出不是身份凭证。
+
+可信身份来自上游 Runtime 的控制面 Header。MCP Adapter 先通过 `McpServiceAuthenticationFilter` 验证 Runtime 的服务凭据，只有验证成功后才由 `TrustedMcpRequestContext` 读取：
+
+```text
+X-User-Id
+X-Tenant-Id
+X-Roles
+```
+
+并构造 `BusinessIdentity`。
+
+## 为什么身份还要继续传给 OMS？
+
+Codex Approval 只代表“允许 Agent 尝试这次 Tool Call”。最终业务操作仍必须由真实订单系统判断：
+
+```text
+当前用户是否有权限？
+订单是否属于当前 tenant？
+用户是否能访问这个订单？
+当前订单状态是否允许取消？
+金额或风控规则是否允许？
+```
+
+因此 `HttpOrderGateway` 同时传递：
+
+```text
+ORDER_SERVICE_TOKEN       # MCP Adapter → OMS 服务认证
+X-User-Id                 # 当前业务用户
+X-Tenant-Id               # 当前企业租户
+X-Roles                   # 当前实时角色
+```
+
+真正的 RBAC / ABAC / Tenant / Resource Ownership 必须由 OMS 再执行一次。
+
+## 为什么要拆 OrderMcpTools / OrderService / OrderGateway？
+
+```text
+OrderMcpTools
+= Agent 协议适配，只定义模型可见业务能力
+
+OrderService
+= 应用用例，不依赖 Codex / MCP
+
+OrderGateway
+= 访问订单系统的端口
+
+HttpOrderGateway
+= 当前 HTTP 基础设施实现
+```
+
+如果企业订单系统以后从 REST 换成 Dubbo / gRPC / SDK，只替换 Gateway 实现，不改变 Agent Tool 语义。
+
+## 生产依赖
+
+必须配置：
+
+```text
+MCP_SERVICE_TOKEN
 ORDER_SERVICE_BASE_URL
 ORDER_SERVICE_TOKEN
 ```
 
-默认契约路径：
-
-```text
-GET  /api/orders/{orderId}/status
-POST /api/orders/{orderId}/cancel
-```
-
-可以通过：
+可覆盖：
 
 ```text
 ORDER_STATUS_PATH
 ORDER_CANCEL_PATH
 ```
 
-覆盖。
+服务不会使用固定订单、内存状态或测试结果兜底。依赖不可用时明确失败。
 
-模块中不包含内存订单、固定订单 ID 或虚假业务结果。上游订单系统不可用时调用应明确失败，由调用方和 Observability 系统处理。
-
-## 身份与授权边界
-
-不要让模型通过 Tool 参数声明：
-
-```text
-userId
-tenantId
-roles
-```
-
-这些身份信息必须来自可信 Gateway / Authentication Context，并由业务系统验证。
-
-当前模块使用服务间 `ORDER_SERVICE_TOKEN` 连接订单系统；用户/租户级可信上下文会在 Agent Gateway / Identity Context 阶段继续接入。
-
-## 启动
+## 启动示意
 
 ```bash
-export ORDER_SERVICE_BASE_URL=https://oms.internal.example
-export ORDER_SERVICE_TOKEN=***
+export MCP_SERVICE_TOKEN='replace-with-strong-runtime-service-secret'
+export ORDER_SERVICE_BASE_URL='https://oms.internal.example'
+export ORDER_SERVICE_TOKEN='replace-with-order-service-credential'
 
-mvn spring-boot:run
+./mvnw spring-boot:run
 ```
 
 MCP Endpoint：
@@ -110,3 +135,5 @@ MCP Endpoint：
 ```text
 /mcp
 ```
+
+生产部署还应在网络层叠加 mTLS / Service Mesh / NetworkPolicy，并由 Secret Manager 管理和轮换服务凭据。
