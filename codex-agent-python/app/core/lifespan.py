@@ -10,15 +10,13 @@ from app.conversations.conversation_repository import ConversationRepository
 from app.core.config import get_settings
 from app.observability.tracing import configure_tracing
 from app.runtime.codex_runtime import CodexRuntime
+from app.security.runtime_identity import RuntimeIdentityIssuer
 from app.services.agent_service import AgentService
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """装配并释放生产运行依赖。
-
-    PostgreSQL、Codex Runtime、持久化目录或迁移表不可用时直接启动失败，避免半可用状态。
-    """
+    """装配并释放生产运行依赖。"""
 
     settings = get_settings()
     configure_tracing(
@@ -37,6 +35,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         timeout_seconds=settings.approval_timeout_seconds,
     )
 
+    runtime_identity_issuer = RuntimeIdentityIssuer(
+        private_key_path=settings.runtime_identity_private_key_path,
+        key_id=settings.runtime_identity_key_id,
+        issuer=settings.runtime_identity_issuer,
+        audience=settings.runtime_identity_audience,
+        ttl_seconds=settings.runtime_identity_ttl_seconds,
+    )
+
     definition = AgentDefinition(
         agent_id=settings.agent_id,
         workspace=str(settings.agent_workspace),
@@ -44,8 +50,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         mcp_servers=(
             McpServerDefinition(
                 name="order",
-                url=settings.order_mcp_url,
-                service_token=settings.order_mcp_service_token,
+                url=settings.agentgateway_order_mcp_url,
                 enabled_tools=("get_order_status", "cancel_order"),
                 tool_approval_modes=(
                     ("get_order_status", "approve"),
@@ -59,6 +64,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         definition=definition,
         codex_home=settings.codex_home,
         approval_handler=approval_service.handle_codex_request,
+        runtime_identity_issuer=runtime_identity_issuer,
     )
     await runtime.start()
 
@@ -67,6 +73,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         conversation_repository,
         agent_id=definition.agent_id,
         runtime_instance_id=settings.runtime_instance_id,
+        runtime_lease_seconds=settings.runtime_lease_seconds,
     )
 
     app.state.approval_service = approval_service
