@@ -42,7 +42,7 @@ jobs:
           done
       - name: Ruff
         working-directory: codex-agent-python
-        run: ruff check app tests
+        run: ruff check app tests evals
       - name: Pytest
         working-directory: codex-agent-python
         env:
