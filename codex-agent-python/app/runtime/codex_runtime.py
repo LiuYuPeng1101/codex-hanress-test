@@ -17,14 +17,13 @@ from app.agents.definition import AgentDefinition, SandboxPolicy
 from app.events.codex_event_mapper import CodexEventMapper
 from app.events.models import AgentEvent
 from app.observability.tracing import get_tracer
-from app.security.runtime_identity import RuntimeIdentityIssuer
 
 
 class CodexRuntime:
-    """把企业 AgentDefinition 适配到官方 Codex Harness。
+    """当前单 Agent 的 Codex Harness 适配层。
 
-    Codex Harness 仍负责 Thread、Turn、Context、Compaction、Sandbox 与 Tool Loop；
-    但 LLM / MCP 网络出口都被改写到 agentgateway。Runtime 不持有 OpenAI/MCP 后端凭证。
+    Codex Harness 已经负责 agent loop、Thread/Turn、Context、Compaction、Sandbox 和 Tool Loop。
+    本类只把本项目的 AgentDefinition、MCP、Approval、事件和可信业务身份接到 Codex。
     """
 
     def __init__(
@@ -32,12 +31,10 @@ class CodexRuntime:
         definition: AgentDefinition,
         codex_home: Path,
         approval_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
-        runtime_identity_issuer: RuntimeIdentityIssuer,
     ) -> None:
         self._definition = definition
         self._workspace = Path(definition.workspace).resolve()
         self._codex_home = codex_home.resolve()
-        self._runtime_identity_issuer = runtime_identity_issuer
         self._event_mapper = CodexEventMapper()
         self._tracer = get_tracer()
 
@@ -47,16 +44,15 @@ class CodexRuntime:
 
         runtime_env = dict(os.environ)
         runtime_env["CODEX_HOME"] = str(self._codex_home)
-
         self._codex = AsyncCodex(
             config=CodexConfig(
                 env=runtime_env,
-                config_overrides=self._build_runtime_config_overrides(),
+                config_overrides=self._build_mcp_config_overrides(),
             )
         )
 
-        # 当前高层 AsyncCodex 尚未直接暴露人工 approval handler。
-        # 私有 SDK 适配被严格限制在 Runtime Adapter 内；SDK 升级时只需修改这一处。
+        # 当前官方高层 AsyncCodex 尚未直接暴露人工 approval handler。
+        # 私有 SDK 适配只留在这一处，SDK 升级时不扩散到业务代码。
         self._codex._client._sync._approval_handler = approval_handler
         self._started = False
 
@@ -65,21 +61,18 @@ class CodexRuntime:
         return self._definition.agent_id
 
     async def start(self) -> None:
-        if self._started:
-            return
-        await self._codex.__aenter__()
-        self._started = True
+        if not self._started:
+            await self._codex.__aenter__()
+            self._started = True
 
     async def close(self) -> None:
-        if not self._started:
-            return
-        await self._codex.__aexit__(None, None, None)
-        self._started = False
+        if self._started:
+            await self._codex.__aexit__(None, None, None)
+            self._started = False
 
     async def create_thread(
         self,
         *,
-        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
@@ -89,12 +82,7 @@ class CodexRuntime:
             approval_policy=AskForApproval(root=AskForApprovalValue.on_request),
             approvals_reviewer=ApprovalsReviewer.user,
             sandbox=self._sandbox_mode(),
-            config=self._gateway_identity_config(
-                conversation_id=conversation_id,
-                user_id=user_id,
-                tenant_id=tenant_id,
-                roles=roles,
-            ),
+            config=self._mcp_request_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
             cwd=str(self._workspace),
         )
         started = await self._codex._client.thread_start(params)
@@ -108,14 +96,12 @@ class CodexRuntime:
         self,
         thread_id: str,
         *,
-        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> dict[str, Any]:
         thread = await self._resume_thread(
             thread_id,
-            conversation_id=conversation_id,
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
@@ -127,14 +113,12 @@ class CodexRuntime:
         self,
         thread_id: str,
         *,
-        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> None:
         thread = await self._resume_thread(
             thread_id,
-            conversation_id=conversation_id,
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
@@ -153,21 +137,15 @@ class CodexRuntime:
     ) -> str:
         with self._tracer.start_as_current_span("agent.turn") as span:
             self._set_common_span_attributes(span, conversation_id, thread_id, user_id, tenant_id)
-            span.set_attribute("agent.streaming", False)
-
             thread = await self._resume_thread(
                 thread_id,
-                conversation_id=conversation_id,
                 user_id=user_id,
                 tenant_id=tenant_id,
                 roles=roles,
             )
             result = await thread.run(message, sandbox=self._sandbox())
-
             span.set_attribute("agent.runtime.turn.id", result.id)
             span.set_attribute("agent.turn.status", str(result.status))
-            if result.duration_ms is not None:
-                span.set_attribute("agent.turn.duration_ms", result.duration_ms)
             return result.final_response or ""
 
     async def stream_turn(
@@ -182,7 +160,6 @@ class CodexRuntime:
     ) -> AsyncIterator[AgentEvent]:
         thread = await self._resume_thread(
             thread_id,
-            conversation_id=conversation_id,
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
@@ -192,62 +169,31 @@ class CodexRuntime:
         with self._tracer.start_as_current_span("agent.turn.stream") as span:
             self._set_common_span_attributes(span, conversation_id, thread_id, user_id, tenant_id)
             span.set_attribute("agent.runtime.turn.id", turn.id)
-            span.set_attribute("agent.streaming", True)
-
             async for notification in turn.stream():
                 event = self._event_mapper.map(notification, conversation_id)
                 if event is None:
                     continue
-                attributes: dict[str, str] = {
-                    "agent.event.type": event.type,
-                    "agent.conversation.id": conversation_id,
-                    "agent.runtime.thread.id": thread_id,
-                    "agent.runtime.turn.id": turn.id,
-                }
-                tool_name = event.data.get("tool_name")
-                if tool_name:
-                    attributes["agent.tool.name"] = str(tool_name)
-                span.add_event(event.type, attributes=attributes)
+                span.add_event(event.type)
                 yield event
 
     async def _resume_thread(
         self,
         thread_id: str,
         *,
-        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> AsyncThread:
-        """恢复 Thread 时重新签发短期身份，避免长期会话沿用过期权限。"""
-
         self._ensure_started()
         return await self._codex.thread_resume(
             thread_id,
             cwd=str(self._workspace),
             sandbox=self._sandbox(),
-            config=self._gateway_identity_config(
-                conversation_id=conversation_id,
-                user_id=user_id,
-                tenant_id=tenant_id,
-                roles=roles,
-            ),
+            config=self._mcp_request_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
         )
 
-    def _build_runtime_config_overrides(self) -> tuple[str, ...]:
-        """启动 Codex 时固定所有网络型能力的逻辑出口。"""
-
-        model_gateway = self._definition.model_gateway
-        provider = f"model_providers.{model_gateway.provider_id}"
-        overrides: list[str] = [
-            f"model_provider={json.dumps(model_gateway.provider_id)}",
-            f"model={json.dumps(model_gateway.model)}",
-            f"{provider}.name={json.dumps('Agent Gateway')}",
-            f"{provider}.base_url={json.dumps(model_gateway.base_url)}",
-            f"{provider}.wire_api={json.dumps('responses')}",
-            f"{provider}.requires_openai_auth=false",
-        ]
-
+    def _build_mcp_config_overrides(self) -> tuple[str, ...]:
+        overrides: list[str] = []
         for server in self._definition.mcp_servers:
             prefix = f"mcp_servers.{server.name}"
             overrides.extend(
@@ -263,32 +209,22 @@ class CodexRuntime:
                 )
         return tuple(overrides)
 
-    def _gateway_identity_config(
+    def _mcp_request_config(
         self,
         *,
-        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> dict[str, Any]:
-        """同一短期内部 JWT 同时标识本 Turn 的 LLM 与 MCP 出站身份。"""
+        """把当前业务身份通过受控 HTTP Header 传给单 Agent 的 MCP Adapter。"""
 
-        token = self._runtime_identity_issuer.issue(
-            user_id=user_id,
-            tenant_id=tenant_id,
-            conversation_id=conversation_id,
-            agent_id=self._definition.agent_id,
-            roles=roles,
-        )
-        authorization = f"Bearer {token}"
-        config: dict[str, Any] = {
-            f"model_providers.{self._definition.model_gateway.provider_id}.http_headers": {
-                "Authorization": authorization,
-            }
-        }
+        config: dict[str, Any] = {}
         for server in self._definition.mcp_servers:
             config[f"mcp_servers.{server.name}.http_headers"] = {
-                "Authorization": authorization,
+                "Authorization": f"Bearer {server.service_token}",
+                "X-User-Id": user_id,
+                "X-Tenant-Id": tenant_id,
+                "X-Roles": ",".join(sorted(roles)),
             }
         return config
 
@@ -316,7 +252,6 @@ class CodexRuntime:
     ) -> None:
         span.set_attribute("agent.id", self._definition.agent_id)
         span.set_attribute("agent.conversation.id", conversation_id)
-        span.set_attribute("agent.runtime.type", "codex")
         span.set_attribute("agent.runtime.thread.id", thread_id)
         span.set_attribute("agent.sandbox", self._sandbox().value)
         span.set_attribute("enduser.id", user_id)
