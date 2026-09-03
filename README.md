@@ -1,102 +1,89 @@
-# Codex Enterprise Agent Runtime Reference Architecture
+# Codex Single Agent Project
 
-这个仓库以 **Codex Harness** 为执行内核，构建企业 Agent Runtime 的生产级架构基线。
+这个仓库现在只做 **一个生产级业务 Agent**。
 
-当前不是“万能 Agent 平台成品”，而是已经把企业 Runtime 最关键的边界落进代码：Business Conversation、可信身份、MCP 业务能力、Human Approval、多租户、Sandbox、Event、Context/Compaction、Runtime 持久化与实例路由。
-
-## 模块职责
+核心边界固定为：
 
 ```text
-Enterprise Gateway
-       │
-       │ trusted user / tenant / roles
-       ▼
-codex-agent-python
-Enterprise Agent Runtime
-       │
-       │ AgentDefinition → Codex
-       ▼
+内容层
+Skill / Tool / MCP / Policy
+        ↓
+容器层
 Codex Harness
-       │
-       │ MCP + trusted headers
-       ▼
+Agent Loop / Thread / Turn / Context / Compaction / Sandbox
+        ↓
+最小治理层
+Auth / Approval / Audit / OTel / Business Authorization
+```
+
+不再把目标设成 Agent Platform、Agent Control Plane、Agent Registry、Runtime Scheduler 或多 Runtime Router。
+
+## 运行链路
+
+```text
+Business System
+      ↓
+codex-agent-python
+Single Agent Service
+      ↓
+Codex Harness
+      ↓
+Skill + MCP + Tool Policy
+      ↓
 hanress-test
 Order MCP Adapter
-       │
-       ▼
+      ↓
 Real OMS / Business System
 ```
 
-### `codex-agent-python/`
+## `codex-agent-python/`
 
-生产主路径 Runtime，负责：
+负责当前唯一 Agent 的：
 
 ```text
 AgentDefinition
-Business conversation_id
-Conversation → Codex thread mapping
-Trusted Gateway identity
-Runtime instance ownership / sticky routing
+Skill workspace
+MCP / Tool Policy
 Codex Thread / Turn / Resume
-MCP Tool allow-list / Approval Policy
-Identity → MCP HTTP Headers
-PostgreSQL Approval Center
+Conversation → Codex Thread 映射
+Approval
 Sandbox
-Event Mapper / SSE
+Event / SSE
 OpenTelemetry
-Context / Compaction
-CODEX_HOME persistent storage
+Context / Compaction 运维入口
+API Auth
 ```
 
-完整架构问答与真实售后案例见：`codex-agent-python/README.md`。
+它不是新的 Harness。Agent Loop、Context 管理、Compaction、Tool Dispatch 等容器能力继续交给 Codex Harness。
 
-### `hanress-test/`
+详细的“为什么这样开发、代码怎么解决”见 `codex-agent-python/README.md`。
 
-目录名为历史名称，当前职责已经严格收敛为 **Order MCP Adapter**：
+## `hanress-test/`
+
+当前只作为 **Order MCP Adapter**：
 
 ```text
-MCP service authentication
-→ Trusted BusinessIdentity
-→ OrderMcpTools
+MCP Tool
 → OrderService
 → OrderGateway
-→ HttpOrderGateway
 → Real OMS
 ```
 
-Java 不运行 Codex、不保存 Agent Thread、不做模拟审批、不维护虚假订单。
+Java 不运行第二套 Codex Runtime，也不维护虚假订单状态。
 
-完整说明见：`hanress-test/README.md`。
-
-## 当前定位
+## 当前明确不做
 
 ```text
-Codex Harness
-= Agent execution engine
-
-codex-agent-python
-= enterprise runtime boundary / reference implementation
-
-AgentDefinition
-= 某个具体 Agent 的 workspace + sandbox + MCP + tool policy
-
-Java MCP Adapter
-= governed bridge to the system of record
+Agent Registry
+多 Agent Control Plane
+Runtime Scheduler
+Runtime Lease
+Runtime Router
+Agent Marketplace
+统一 Agent Gateway
+自研 Agent Loop
+自研 Context Manager
+自研 Observability Platform
 ```
 
-当前已经形成 Agent Gateway 的早期控制面能力，但独立 Gateway / Registry / Router 仍是下一阶段工程。
-
-## 生产原则
-
-```text
-不伪造业务数据
-不把内存当审批事实源
-不让模型声明身份
-不暴露 Codex thread_id 作为业务主键
-不让 Approval 绕过业务授权
-不直接透传 Codex Raw Event
-不在 Java/Python 运行两套 Codex Runtime
-不依赖容器临时磁盘保存 Thread
-```
-
-CI：`.github/workflows/ci.yml` 会验证 Python + PostgreSQL Runtime 路径和 Java MCP Adapter 构建测试。
+等真正出现多个 Agent、多个团队、统一 MCP/LLM 治理等需求时，再从真实重复能力中抽平台层。
