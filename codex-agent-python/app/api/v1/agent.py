@@ -17,14 +17,16 @@ from app.security.gateway_auth import (
     require_gateway_principal,
     require_operator_principal,
 )
-from app.services.agent_service import AgentService, RuntimeLeaseConflict
+from app.services.agent_service import (
+    AgentService,
+    RuntimeLeaseConflict,
+    RuntimeLeaseLost,
+)
 
 router = APIRouter(prefix="/agents", tags=["Agent"])
 
 
 def _runtime_lease_error(exc: RuntimeLeaseConflict) -> HTTPException:
-    """告诉上游当前 Conversation 暂时由其他健康 Worker 持有。"""
-
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail={
@@ -32,6 +34,13 @@ def _runtime_lease_error(exc: RuntimeLeaseConflict) -> HTTPException:
             "owner": exc.owner,
             "lease_expires_at": exc.expires_at.isoformat(),
         },
+    )
+
+
+def _runtime_lease_lost_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"code": "RUNTIME_LEASE_LOST"},
     )
 
 
@@ -65,6 +74,8 @@ async def read_conversation(
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
     except RuntimeLeaseConflict as exc:
         raise _runtime_lease_error(exc) from exc
+    except RuntimeLeaseLost as exc:
+        raise _runtime_lease_lost_error() from exc
     return ConversationReadResponse(
         conversation_id=conversation_id,
         runtime_snapshot=snapshot,
@@ -91,6 +102,8 @@ async def compact_conversation(
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
     except RuntimeLeaseConflict as exc:
         raise _runtime_lease_error(exc) from exc
+    except RuntimeLeaseLost as exc:
+        raise _runtime_lease_lost_error() from exc
     return CompactConversationResponse(
         conversation_id=conversation_id,
         status="COMPACTION_STARTED",
@@ -116,6 +129,8 @@ async def run_turn(
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
     except RuntimeLeaseConflict as exc:
         raise _runtime_lease_error(exc) from exc
+    except RuntimeLeaseLost as exc:
+        raise _runtime_lease_lost_error() from exc
     return RunTurnResponse(conversation_id=conversation_id, answer=answer)
 
 
@@ -151,6 +166,9 @@ async def stream_turn(
                 },
                 ensure_ascii=False,
             )
+            yield f"event: error\ndata: {payload}\n\n"
+        except RuntimeLeaseLost:
+            payload = json.dumps({"code": "RUNTIME_LEASE_LOST"}, ensure_ascii=False)
             yield f"event: error\ndata: {payload}\n\n"
 
     return StreamingResponse(
