@@ -13,6 +13,27 @@ class SandboxPolicy(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ModelGatewayDefinition:
+    """Agent 使用的模型出口。
+
+    `base_url` 必须指向 agentgateway 的 OpenAI-compatible `/v1` 入口。
+    Runtime 不持有模型提供商 API Key。
+    """
+
+    base_url: str
+    model: str
+    provider_id: str = "agentgateway"
+
+    def __post_init__(self) -> None:
+        if not self.base_url:
+            raise ValueError("Model Gateway base_url 不能为空")
+        if not self.model:
+            raise ValueError("model 不能为空")
+        if not self.provider_id.replace("_", "").replace("-", "").isalnum():
+            raise ValueError("provider_id 只能包含字母、数字、_、-")
+
+
+@dataclass(frozen=True, slots=True)
 class McpServerDefinition:
     """Agent 通过 agentgateway 访问的一个逻辑 MCP Server。
 
@@ -60,6 +81,7 @@ class AgentDefinition:
     agent_id: str
     workspace: str
     sandbox: SandboxPolicy
+    model_gateway: ModelGatewayDefinition
     mcp_servers: tuple[McpServerDefinition, ...]
 
     def __post_init__(self) -> None:
