@@ -25,6 +25,7 @@ class AgentObservation:
             "tool_calls": self.tool_calls,
             "approval_created": self.approval_created,
             "events": self.events,
+            "skipped": False,
         }
 
 
@@ -63,6 +64,17 @@ class LangSmithAgentTarget:
         )
 
     def __call__(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        fixture = inputs.get("requires_fixture")
+        if fixture:
+            return {
+                "answer": "",
+                "tool_calls": [],
+                "approval_created": False,
+                "events": [],
+                "skipped": True,
+                "skip_reason": f"需要外部 fixture: {fixture}",
+            }
+
         message = str(inputs.get("message") or "").strip()
         if not message:
             raise ValueError("LangSmith Dataset example 缺少 message")
