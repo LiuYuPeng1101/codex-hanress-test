@@ -17,13 +17,14 @@ from app.agents.definition import AgentDefinition, SandboxPolicy
 from app.events.codex_event_mapper import CodexEventMapper
 from app.events.models import AgentEvent
 from app.observability.tracing import get_tracer
+from app.security.runtime_identity import RuntimeIdentityIssuer
 
 
 class CodexRuntime:
     """把企业 AgentDefinition 适配到官方 Codex Harness。
 
-    这一层不包含订单、合同、财务等业务名词。它负责把控制面定义翻译成 Codex 的：
-    Thread、MCP 配置、Tool allow-list、Approval Policy、Sandbox、Event 与 Context 生命周期。
+    Runtime 只负责 Thread、Sandbox、Approval、Event 与 Context 生命周期。
+    所有 MCP 出站必须访问 AgentDefinition 中配置的 agentgateway 入口；Runtime 不持有真实后端凭证。
     """
 
     def __init__(
@@ -31,10 +32,12 @@ class CodexRuntime:
         definition: AgentDefinition,
         codex_home: Path,
         approval_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
+        runtime_identity_issuer: RuntimeIdentityIssuer,
     ) -> None:
         self._definition = definition
         self._workspace = Path(definition.workspace).resolve()
         self._codex_home = codex_home.resolve()
+        self._runtime_identity_issuer = runtime_identity_issuer
         self._event_mapper = CodexEventMapper()
         self._tracer = get_tracer()
 
@@ -76,18 +79,24 @@ class CodexRuntime:
     async def create_thread(
         self,
         *,
+        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> str:
-        """创建带人工 reviewer、最小 Sandbox 与可信 MCP 身份的 Codex Thread。"""
+        """创建带人工 reviewer、最小 Sandbox 与短期出站身份的 Codex Thread。"""
 
         self._ensure_started()
         params = ThreadStartParams(
             approval_policy=AskForApproval(root=AskForApprovalValue.on_request),
             approvals_reviewer=ApprovalsReviewer.user,
             sandbox=self._sandbox_mode(),
-            config=self._mcp_identity_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
+            config=self._mcp_identity_config(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
+            ),
             cwd=str(self._workspace),
         )
         started = await self._codex._client.thread_start(params)
@@ -101,12 +110,14 @@ class CodexRuntime:
         self,
         thread_id: str,
         *,
+        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> dict[str, Any]:
         thread = await self._resume_thread(
             thread_id,
+            conversation_id=conversation_id,
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
@@ -118,12 +129,14 @@ class CodexRuntime:
         self,
         thread_id: str,
         *,
+        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> None:
         thread = await self._resume_thread(
             thread_id,
+            conversation_id=conversation_id,
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
@@ -146,6 +159,7 @@ class CodexRuntime:
 
             thread = await self._resume_thread(
                 thread_id,
+                conversation_id=conversation_id,
                 user_id=user_id,
                 tenant_id=tenant_id,
                 roles=roles,
@@ -170,6 +184,7 @@ class CodexRuntime:
     ) -> AsyncIterator[AgentEvent]:
         thread = await self._resume_thread(
             thread_id,
+            conversation_id=conversation_id,
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
@@ -201,18 +216,24 @@ class CodexRuntime:
         self,
         thread_id: str,
         *,
+        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> AsyncThread:
-        """恢复 Thread 时重新注入当前可信身份，避免长期会话沿用过期角色。"""
+        """恢复 Thread 时重新签发短期身份，避免长期会话沿用过期权限。"""
 
         self._ensure_started()
         return await self._codex.thread_resume(
             thread_id,
             cwd=str(self._workspace),
             sandbox=self._sandbox(),
-            config=self._mcp_identity_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
+            config=self._mcp_identity_config(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
+            ),
         )
 
     def _build_mcp_config_overrides(self) -> tuple[str, ...]:
@@ -235,19 +256,24 @@ class CodexRuntime:
     def _mcp_identity_config(
         self,
         *,
+        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> dict[str, Any]:
-        """把可信身份放入每个 MCP Server 的 HTTP Header，而不是 Tool 参数。"""
+        """只向 agentgateway 传短期内部 JWT，不传真实后端凭证。"""
 
+        token = self._runtime_identity_issuer.issue(
+            user_id=user_id,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            agent_id=self._definition.agent_id,
+            roles=roles,
+        )
         config: dict[str, Any] = {}
         for server in self._definition.mcp_servers:
             config[f"mcp_servers.{server.name}.http_headers"] = {
-                "Authorization": f"Bearer {server.service_token}",
-                "X-User-Id": user_id,
-                "X-Tenant-Id": tenant_id,
-                "X-Roles": ",".join(sorted(roles)),
+                "Authorization": f"Bearer {token}",
             }
         return config
 
