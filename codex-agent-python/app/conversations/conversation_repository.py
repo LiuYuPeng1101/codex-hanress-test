@@ -4,7 +4,17 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, MetaData, String, Table, create_engine, insert, select, text
+from sqlalchemy import (
+    Column,
+    DateTime,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    insert,
+    select,
+    text,
+)
 from sqlalchemy.engine import Engine
 
 
@@ -76,7 +86,13 @@ class ConversationRepository:
             )
         return item
 
-    def get_owned(self, conversation_id: str, *, tenant_id: str, user_id: str) -> Conversation:
+    def get_owned(
+        self,
+        conversation_id: str,
+        *,
+        tenant_id: str,
+        user_id: str,
+    ) -> Conversation:
         stmt = select(conversations).where(
             conversations.c.id == conversation_id,
             conversations.c.tenant_id == tenant_id,
