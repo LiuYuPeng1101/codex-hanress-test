@@ -37,7 +37,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     approval_service = ApprovalService(
         approval_repository,
         conversation_repository,
-        timeout_seconds=settings.approval_timeout_seconds,
     )
 
     runtime_identity_issuer = RuntimeIdentityIssuer(
