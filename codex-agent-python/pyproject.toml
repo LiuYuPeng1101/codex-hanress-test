@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-agent-python"
-version = "0.3.0"
-description = "Codex 企业 Agent Runtime 参考实现"
+version = "0.4.0"
+description = "基于 Codex Harness 的生产级单 Agent Service"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.116,<1.0",
@@ -14,7 +14,6 @@ dependencies = [
     "openai-codex==0.147.0",
     "sqlalchemy>=2.0,<3.0",
     "psycopg[binary]>=3.2,<4.0",
-    "PyJWT[crypto]>=2.10,<3.0",
     "opentelemetry-api>=1.36,<2.0",
     "opentelemetry-sdk>=1.36,<2.0",
     "opentelemetry-exporter-otlp-proto-http>=1.36,<2.0",
