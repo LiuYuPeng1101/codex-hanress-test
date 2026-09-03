@@ -5,7 +5,7 @@ from enum import Enum
 
 
 class SandboxPolicy(str, Enum):
-    """Agent Definition 层的运行权限，不直接依赖 Codex SDK 枚举。"""
+    """单 Agent 的本地运行权限。"""
 
     READ_ONLY = "read_only"
     WORKSPACE_WRITE = "workspace_write"
@@ -13,36 +13,12 @@ class SandboxPolicy(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
-class ModelGatewayDefinition:
-    """Agent 使用的模型出口。
-
-    `base_url` 必须指向 agentgateway 的 OpenAI-compatible `/v1` 入口。
-    Runtime 不持有模型提供商 API Key。
-    """
-
-    base_url: str
-    model: str
-    provider_id: str = "agentgateway"
-
-    def __post_init__(self) -> None:
-        if not self.base_url:
-            raise ValueError("Model Gateway base_url 不能为空")
-        if not self.model:
-            raise ValueError("model 不能为空")
-        if not self.provider_id.replace("_", "").replace("-", "").isalnum():
-            raise ValueError("provider_id 只能包含字母、数字、_、-")
-
-
-@dataclass(frozen=True, slots=True)
 class McpServerDefinition:
-    """Agent 通过 agentgateway 访问的一个逻辑 MCP Server。
-
-    `url` 必须指向 agentgateway 的受治理入口，而不是真实 MCP 后端地址。
-    Runtime 不保存真实后端 token；真实 credential 由 agentgateway backendAuth 管理。
-    """
+    """当前单 Agent 可使用的一个 MCP Server 及 Tool Policy。"""
 
     name: str
     url: str
+    service_token: str
     enabled_tools: tuple[str, ...]
     tool_approval_modes: tuple[tuple[str, str], ...]
     default_approval_mode: str = "approve"
@@ -52,6 +28,8 @@ class McpServerDefinition:
             raise ValueError("MCP Server name 只能包含字母、数字、_、-")
         if not self.url:
             raise ValueError("MCP Server url 不能为空")
+        if len(self.service_token) < 32:
+            raise ValueError("MCP service_token 至少 32 字符")
         if not self.enabled_tools:
             raise ValueError("MCP Server 至少需要暴露一个 Tool")
 
@@ -66,22 +44,18 @@ class McpServerDefinition:
             if approval_mode not in allowed_modes:
                 raise ValueError(f"Tool {tool_name} 的审批模式非法")
 
-    @property
-    def approval_modes(self) -> dict[str, str]:
-        return dict(self.tool_approval_modes)
-
 
 @dataclass(frozen=True, slots=True)
 class AgentDefinition:
-    """控制面中的 Agent 定义。
+    """当前唯一业务 Agent 的运行定义。
 
-    Runtime 应依赖这个稳定定义，而不是在 Codex Adapter 中写死某个订单、合同或财务 Agent。
+    这里只描述内容层和最小运行策略：workspace、sandbox、MCP、Tool Policy。
+    不承担 Agent Registry、Runtime Router 或多 Agent Control Plane 职责。
     """
 
     agent_id: str
     workspace: str
     sandbox: SandboxPolicy
-    model_gateway: ModelGatewayDefinition
     mcp_servers: tuple[McpServerDefinition, ...]
 
     def __post_init__(self) -> None:
@@ -91,4 +65,4 @@ class AgentDefinition:
             raise ValueError("workspace 不能为空")
         names = [server.name for server in self.mcp_servers]
         if len(names) != len(set(names)):
-            raise ValueError("Agent Definition 中 MCP Server name 不能重复")
+            raise ValueError("MCP Server name 不能重复")

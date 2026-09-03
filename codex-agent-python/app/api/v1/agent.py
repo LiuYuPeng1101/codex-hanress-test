@@ -1,7 +1,7 @@
 import json
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import get_agent_service
@@ -12,42 +12,20 @@ from app.schemas.agent import (
     RunTurnRequest,
     RunTurnResponse,
 )
-from app.security.gateway_auth import (
-    GatewayPrincipal,
-    require_gateway_principal,
+from app.security.service_auth import (
+    ServicePrincipal,
     require_operator_principal,
+    require_service_principal,
 )
-from app.services.agent_service import (
-    AgentService,
-    RuntimeLeaseConflict,
-    RuntimeLeaseLost,
-)
+from app.services.agent_service import AgentService
 
-router = APIRouter(prefix="/agents", tags=["Agent"])
-
-
-def _runtime_lease_error(exc: RuntimeLeaseConflict) -> HTTPException:
-    return HTTPException(
-        status_code=status.HTTP_409_CONFLICT,
-        detail={
-            "code": "RUNTIME_LEASE_HELD",
-            "owner": exc.owner,
-            "lease_expires_at": exc.expires_at.isoformat(),
-        },
-    )
-
-
-def _runtime_lease_lost_error() -> HTTPException:
-    return HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail={"code": "RUNTIME_LEASE_LOST"},
-    )
+router = APIRouter(prefix="/agent", tags=["Agent"])
 
 
 @router.post("/conversations", response_model=CreateConversationResponse)
 async def create_conversation(
     service: Annotated[AgentService, Depends(get_agent_service)],
-    principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
+    principal: Annotated[ServicePrincipal, Depends(require_service_principal)],
 ) -> CreateConversationResponse:
     conversation = await service.create_conversation(
         tenant_id=principal.tenant_id,
@@ -61,7 +39,7 @@ async def create_conversation(
 async def read_conversation(
     conversation_id: str,
     service: Annotated[AgentService, Depends(get_agent_service)],
-    principal: Annotated[GatewayPrincipal, Depends(require_operator_principal)],
+    principal: Annotated[ServicePrincipal, Depends(require_operator_principal)],
 ) -> ConversationReadResponse:
     try:
         snapshot = await service.read_conversation(
@@ -72,10 +50,6 @@ async def read_conversation(
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
-    except RuntimeLeaseConflict as exc:
-        raise _runtime_lease_error(exc) from exc
-    except RuntimeLeaseLost as exc:
-        raise _runtime_lease_lost_error() from exc
     return ConversationReadResponse(
         conversation_id=conversation_id,
         runtime_snapshot=snapshot,
@@ -89,7 +63,7 @@ async def read_conversation(
 async def compact_conversation(
     conversation_id: str,
     service: Annotated[AgentService, Depends(get_agent_service)],
-    principal: Annotated[GatewayPrincipal, Depends(require_operator_principal)],
+    principal: Annotated[ServicePrincipal, Depends(require_operator_principal)],
 ) -> CompactConversationResponse:
     try:
         await service.compact_conversation(
@@ -100,10 +74,6 @@ async def compact_conversation(
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
-    except RuntimeLeaseConflict as exc:
-        raise _runtime_lease_error(exc) from exc
-    except RuntimeLeaseLost as exc:
-        raise _runtime_lease_lost_error() from exc
     return CompactConversationResponse(
         conversation_id=conversation_id,
         status="COMPACTION_STARTED",
@@ -115,7 +85,7 @@ async def run_turn(
     conversation_id: str,
     request: RunTurnRequest,
     service: Annotated[AgentService, Depends(get_agent_service)],
-    principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
+    principal: Annotated[ServicePrincipal, Depends(require_service_principal)],
 ) -> RunTurnResponse:
     try:
         answer = await service.chat(
@@ -127,10 +97,6 @@ async def run_turn(
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
-    except RuntimeLeaseConflict as exc:
-        raise _runtime_lease_error(exc) from exc
-    except RuntimeLeaseLost as exc:
-        raise _runtime_lease_lost_error() from exc
     return RunTurnResponse(conversation_id=conversation_id, answer=answer)
 
 
@@ -139,10 +105,8 @@ async def stream_turn(
     conversation_id: str,
     request: RunTurnRequest,
     service: Annotated[AgentService, Depends(get_agent_service)],
-    principal: Annotated[GatewayPrincipal, Depends(require_gateway_principal)],
+    principal: Annotated[ServicePrincipal, Depends(require_service_principal)],
 ) -> StreamingResponse:
-    """通过 SSE 只推送稳定 AgentEvent，不暴露 Codex Thread / Turn ID。"""
-
     async def event_stream():
         try:
             async for event in service.stream_chat(
@@ -157,25 +121,9 @@ async def stream_turn(
         except KeyError:
             payload = json.dumps({"code": "CONVERSATION_NOT_FOUND"}, ensure_ascii=False)
             yield f"event: error\ndata: {payload}\n\n"
-        except RuntimeLeaseConflict as exc:
-            payload = json.dumps(
-                {
-                    "code": "RUNTIME_LEASE_HELD",
-                    "owner": exc.owner,
-                    "lease_expires_at": exc.expires_at.isoformat(),
-                },
-                ensure_ascii=False,
-            )
-            yield f"event: error\ndata: {payload}\n\n"
-        except RuntimeLeaseLost:
-            payload = json.dumps({"code": "RUNTIME_LEASE_LOST"}, ensure_ascii=False)
-            yield f"event: error\ndata: {payload}\n\n"
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
