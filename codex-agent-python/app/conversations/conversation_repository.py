@@ -166,6 +166,33 @@ class ConversationRepository:
             row = conn.execute(stmt).mappings().one_or_none()
         return self._from_row(row) if row is not None else None
 
+    def renew_lease(
+        self,
+        conversation_id: str,
+        *,
+        runtime_instance_id: str,
+        lease_seconds: int,
+    ) -> bool:
+        """只允许当前 owner 为活跃 Turn 续租。
+
+        如果 owner 已变化或记录不存在，返回 False。调用方必须停止继续执行，避免双 Worker 并发。
+        """
+
+        now = datetime.now(timezone.utc)
+        stmt = (
+            update(conversations)
+            .where(
+                conversations.c.id == conversation_id,
+                conversations.c.runtime_lease_owner == runtime_instance_id,
+            )
+            .values(
+                runtime_lease_expires_at=now + timedelta(seconds=lease_seconds),
+            )
+        )
+        with self._engine.begin() as conn:
+            result = conn.execute(stmt)
+        return result.rowcount == 1
+
     def find_by_runtime_thread_id(self, runtime_thread_id: str) -> Conversation:
         stmt = select(conversations).where(
             conversations.c.runtime_thread_id == runtime_thread_id
