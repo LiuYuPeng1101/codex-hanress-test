@@ -18,9 +18,14 @@ class Settings(BaseSettings):
     runtime_lease_seconds: int = Field(default=30, ge=10, le=300)
     codex_home: Path = Field(description="Codex 持久化目录；生产环境必须挂载可恢复的持久存储")
 
+    agentgateway_llm_base_url: str = Field(
+        description="Codex 模型请求经 agentgateway 暴露的 OpenAI-compatible /v1 入口"
+    )
+    codex_model: str = Field(default="gpt-5", description="通过 agentgateway 请求的模型名")
     agentgateway_order_mcp_url: str = Field(
         description="订单 MCP 经 agentgateway 暴露的受治理入口；禁止直连真实 MCP Adapter"
     )
+
     runtime_identity_private_key_path: Path = Field(
         description="签发 Runtime 短期内部 JWT 的 RSA 私钥路径"
     )
