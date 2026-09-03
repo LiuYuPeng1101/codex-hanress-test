@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import jwt
 
@@ -8,19 +9,21 @@ import jwt
 class RuntimeIdentityIssuer:
     """为 Runtime 出站请求签发短期内部身份令牌。
 
-    令牌只表达“谁、哪个租户、哪个会话、哪个 Agent 正在发起请求”，
-    不包含真实后端凭证。真实 MCP/LLM 凭证应只存在于 agentgateway 的 backendAuth。
+    Agent Service 持有 RSA 私钥；agentgateway 只配置对应公钥/JWKS。
+    Runtime 只能拿到短期 JWT，不接触签名私钥和真实后端凭证。
     """
 
     def __init__(
         self,
         *,
-        signing_key: str,
+        private_key_path: Path,
+        key_id: str,
         issuer: str,
         audience: str,
         ttl_seconds: int,
     ) -> None:
-        self._signing_key = signing_key
+        self._private_key = private_key_path.read_text(encoding="utf-8")
+        self._key_id = key_id
         self._issuer = issuer
         self._audience = audience
         self._ttl_seconds = ttl_seconds
@@ -46,4 +49,9 @@ class RuntimeIdentityIssuer:
             "iat": now,
             "exp": now + timedelta(seconds=self._ttl_seconds),
         }
-        return jwt.encode(payload, self._signing_key, algorithm="HS256")
+        return jwt.encode(
+            payload,
+            self._private_key,
+            algorithm="RS256",
+            headers={"kid": self._key_id},
+        )
