@@ -33,12 +33,13 @@ jobs:
       - name: Install Python dependencies
         working-directory: codex-agent-python
         run: pip install -e ".[dev]"
-      - name: Apply database migration
+      - name: Apply database migrations
         env:
           PGPASSWORD: agent
-        run: >-
-          psql -h 127.0.0.1 -U agent -d agent_runtime
-          -f codex-agent-python/migrations/001_initial_runtime_schema.sql
+        run: |
+          for migration in codex-agent-python/migrations/*.sql; do
+            psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U agent -d agent_runtime -f "$migration"
+          done
       - name: Ruff
         working-directory: codex-agent-python
         run: ruff check app tests
