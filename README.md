@@ -1,99 +1,63 @@
 # Codex Single Agent Project
 
-这个仓库现在只做 **一个生产级业务 Agent**。
+这个仓库只做 **一个基于 Codex Harness 的生产级业务 Agent**。当前示例是订单 / 售后 Agent。
 
-核心边界固定为：
+> 当前状态：**已经形成生产级架构基线，但尚未完成全部生产就绪验证。**
+
+详细生产审计见：`codex-agent-python/docs/PRODUCTION_READINESS.md`。
+
+## 三层边界
 
 ```text
-内容层
+内容层：我们重点开发
 Skill / Tool / MCP / Policy
         ↓
-容器层
-Codex Harness
-Agent Loop / Thread / Turn / Context / Compaction / Sandbox
+容器层：Codex Harness
+Agent Loop / Thread / Turn / Context / Compaction / Sandbox / Tool Dispatch
         ↓
-最小治理层
-Auth / Approval / Audit / OTel / Business Authorization
+最小治理层：单 Agent 必需
+Auth / Approval / Conversation / Event / OTel / Business Authorization
 ```
 
-不再把目标设成 Agent Platform、Agent Control Plane、Agent Registry、Runtime Scheduler 或多 Runtime Router。
+不重新实现 Agent Loop、Context Manager、Runtime Platform，也不因为用户多就提前开发 Agent Control Plane。
 
-## 运行链路
+## 当前运行链路
 
 ```text
-Business System
-      ↓
-codex-agent-python
-Single Agent Service
-      ↓
-Codex Harness
-      ↓
+Business System / 客服前端
+          ↓
+     Agent Service
+          ↓
+     Codex Harness
+          ↓
 Skill + MCP + Tool Policy
-      ↓
-hanress-test
-Order MCP Adapter
-      ↓
-Real OMS / Business System
+          ↓
+   Order MCP Adapter
+          ↓
+          OMS
 ```
 
-## `codex-agent-python/`
+`codex-agent-python/` 负责当前 Agent 的 Python Service、Codex Runtime Adapter、Conversation、Approval、Event/SSE、Auth、OTel 和 Evals；`hanress-test/` 当前只作为 Java Order MCP Adapter。
 
-负责当前唯一 Agent 的：
+详细架构问答见：`codex-agent-python/README.md`。
 
-```text
-AgentDefinition
-Skill workspace
-MCP / Tool Policy
-Codex Thread / Turn / Resume
-Conversation → Codex Thread 映射
-Approval
-Sandbox
-Event / SSE
-OpenTelemetry
-Context / Compaction 运维入口
-API Auth
-```
+## 如果以后开发第二个 Agent，哪些可以复用？
 
-它不是新的 Harness。Agent Loop、Context 管理、Compaction、Tool Dispatch 等容器能力继续交给 Codex Harness。
-
-详细的“为什么这样开发、代码怎么解决”见 `codex-agent-python/README.md`。
-
-## 如果以后开发第二个 Agent，哪些可以直接复用？
-
-例如现在是订单 / 售后 Agent，以后再开发合同 Agent、财务 Agent 或客服 Agent，下面这些工程能力原则上可以直接复用：
+可以复用的工程壳：
 
 ```text
 FastAPI Service 结构
-app/runtime/codex_runtime.py
+CodexRuntime
 Conversation → Codex Thread 映射
 Service Auth
 Approval Framework
-Codex Event Mapper
-SSE API
+Codex Event Mapper / SSE
 OpenTelemetry
-Dockerfile / 部署骨架
-PostgreSQL 基础能力
-Eval Runner
+Docker / PostgreSQL 基础能力
+LangSmith Eval Target / Evaluator 模式
 ```
 
-其中最核心的是：
-
-```text
-CodexRuntime
-= 把当前 Agent 的 MCP / Tool Policy / Sandbox 接到 Codex Harness
-
-Conversation
-= 业务 conversation_id ↔ Codex thread_id
-
-Approval / Auth / Event / OTel
-= 单 Agent 的最小生产治理
-```
-
-这些能力和“订单”本身没有强业务绑定，所以第二个 Agent 不应该重新实现一遍。
-
-## 第二个 Agent 必须自己开发什么？
-
-真正需要重新开发的是内容层和对应的业务能力：
+第二个 Agent 必须重新开发的主要是：
 
 ```text
 Skill
@@ -102,61 +66,22 @@ Tool Contract
 Tool Policy
 Sandbox Policy
 业务授权契约
-Eval Cases
+Eval Dataset / 业务评分标准
 ```
 
-例如：
+例如合同 Agent 不应该复制第二套 Codex Runtime，而是复用工程壳，重新开发 `contract-review Skill + Contract MCP + Contract Policy + Contract Evals`。
+
+## 单 Agent 很多人使用时怎么扩容？
+
+一个 Agent 可以有很多独立 Thread：
 
 ```text
-订单 Agent
-├── Skill: order-analysis
-├── Tool: get_order_status / cancel_order
-└── Policy: cancel_order → approval
-
-合同 Agent
-├── Skill: contract-review
-├── Tool: get_contract / search_clause / submit_review
-└── Policy: submit_review → approval
+用户 A → conversation A → thread A
+用户 B → conversation B → thread B
+用户 C → conversation C → thread C
 ```
 
-所以以后开发第二个 Agent 的正确方式不是复制整套 Runtime，而是：
-
-```text
-复用工程壳
-        +
-重新开发 Skill / MCP / Tool / Policy / Eval
-```
-
-如果未来多个 Agent 真的产生大量重复代码，再从真实重复中抽共享库或平台能力；现在不提前做 Agent Platform。
-
-## 单 Agent 很多人使用时，怎么扩容？
-
-一个 Agent 可以同时服务很多用户：
-
-```text
-用户 A → conversation A → Codex thread A
-用户 B → conversation B → Codex thread B
-用户 C → conversation C → Codex thread C
-```
-
-“单 Agent”表示只有一种 Agent 能力定义，不表示只能有一个用户或一个 Thread。
-
-### 术语 1：Thread
-
-可以理解成“一个用户的一本独立聊天记录”。
-
-所以：
-
-```text
-一个售后 Agent
-可以有很多 Thread
-```
-
-不同用户的上下文互不混淆。
-
-### 第一阶段：只有一个 Runtime 时
-
-当前就是：
+当前 V1 只有一个 Runtime：
 
 ```text
 用户
@@ -164,358 +89,139 @@ Eval Cases
 Agent API
  ↓
 PostgreSQL
-conversation_id → runtime_thread_id
+conversation → thread_id
  ↓
-当前唯一 Codex Runtime
- ↓
-thread_resume(thread_id)
+唯一 Codex Runtime
 ```
 
-这时候不需要 `runtime_slot`。
+此时不需要 `runtime_slot`。先通过并发限制保证一个 Runtime 不被无限请求拖垮。
 
-一个 `AsyncCodex` 可以服务很多不同 Thread，但生产上必须设置并发上限，不能无限接收 Turn。
-
-例如：
+只有单 Runtime 真到容量瓶颈时才进入 V2：
 
 ```text
-最多同时运行 30 个 Turn
-第 31 个以后短暂等待
-队列也满了就返回“当前繁忙，请稍后再试”
-```
-
-术语：`Concurrency Limit`，就是“同时最多处理多少个请求”。
-
-### 第二阶段：一个 Runtime 不够用了
-
-假设一个 Runtime 最多稳定跑 30 个并发，但业务同时有 150 个活跃 Turn，就增加 Runtime：
-
-```text
-Runtime-0
-Runtime-1
-Runtime-2
-Runtime-3
-Runtime-4
-```
-
-术语：`Horizontal Scaling`，就是“不是把一台机器无限加大，而是多开几台一样的 Runtime”。
-
-这时候数据库里的 Conversation 增加：
-
-```text
-runtime_slot
-```
-
-例如：
-
-```text
-conversation_id = conv-A
-runtime_thread_id = thread-abc
-runtime_slot = 2
-```
-
-`runtime_slot = 2` 的意思就是：
-
-> 这个 Conversation 分配给 Runtime-2。
-
-Agent API 收到下一条消息时：
-
-```text
-用户继续 conv-A
- ↓
 Agent API
  ↓
-查 PostgreSQL
+PostgreSQL
+conversation → thread_id + runtime_slot
  ↓
-thread_id = abc
-runtime_slot = 2
+Runtime-0 / Runtime-1 / Runtime-2
  ↓
-把请求送到 Runtime-2
- ↓
-Runtime-2 执行 thread_resume(abc)
+每个 Runtime 独立 CODEX_HOME 持久盘
 ```
 
-所以扩容后的 Agent API 主要做：
+`runtime_slot=2` 就表示这个 Conversation 以后送到 Runtime-2。
+
+同时需要保证：
 
 ```text
-1. Auth：你是谁？
-2. Conversation Ownership：这个会话是不是你的？
-3. 查 PostgreSQL：thread_id + runtime_slot
-4. 把请求送给正确 Runtime
-5. 把 SSE 结果返回给前端
+同一 Conversation → 同时只执行一个 Turn
+不同 Conversation → 可以并行
 ```
 
-### 术语 2：Persistent Volume
+多实例后可以用 Redis Lock 或 PostgreSQL advisory lock 做这件事。
 
-每个 Runtime 都需要自己的持久化磁盘保存 `CODEX_HOME`。
+用户多是扩容问题；真正出现多个 Agent / 多团队 / 统一 MCP 治理时，才重新评估 Gateway / Registry / Control Plane。
 
-可以理解成：
+## 为什么现在没有 Vector DB / Graph DB？
 
-```text
-Runtime-0 → 自己的永久文件柜
-Runtime-1 → 自己的永久文件柜
-Runtime-2 → 自己的永久文件柜
-```
-
-如果 Runtime-2 进程挂了，重启后的 Runtime-2 重新挂载原来的磁盘，就还能继续恢复以前的 Thread。
-
-不要让多个 Runtime 同时写同一个 `CODEX_HOME`。
-
-### 术语 3：Redis Lock
-
-同一个 Conversation 同一时间不要执行两个 Turn。
-
-例如用户连续点两次：
+因为当前订单 Agent 的实时事实来自 OMS：
 
 ```text
-“取消订单 1001”
-“取消订单 1001”
-```
-
-需要保证：
-
-```text
-conv-A 的 Turn-1 正在执行
-→ Turn-2 先等待或直接返回“正在处理中”
-```
-
-但：
-
-```text
-conv-A
-conv-B
-conv-C
-```
-
-可以并行。
-
-这类“同一 Conversation 串行、不同 Conversation 并行”的控制，可以用 Redis 分布式锁实现。
-
-### 术语 4：Load Balancer
-
-以后 Agent API 自身也可能有多台：
-
-```text
-API-1
-API-2
-API-3
-```
-
-前面放一个 Load Balancer，把用户请求分给不同 API 实例。
-
-API 本身不保存 Codex Thread 状态，所以哪一台 API 接到请求都可以；真正的 Thread 会根据 PostgreSQL 里的 `runtime_slot` 被送到正确 Runtime。
-
-### 最终扩容图
-
-```text
-                    用户
-                     │
-                     ▼
-              Load Balancer
-                     │
-          ┌──────────┼──────────┐
-          ▼          ▼          ▼
-        API-1      API-2      API-3
-                     │
-                     ▼
-                PostgreSQL
-          conversation → thread
-          conversation → runtime_slot
-                     │
-      ┌──────────────┼──────────────┐
-      ▼              ▼              ▼
-  Runtime-0       Runtime-1       Runtime-2
-      │              │              │
- CODEX_HOME-0    CODEX_HOME-1    CODEX_HOME-2
-      │              │              │
-      └──────────── MCP ────────────┘
-                     │
-                     ▼
-                 业务系统
-
-Redis
-→ 只负责同一 conversation 的并发锁、限流等短期状态
-```
-
-### 扩容顺序
-
-```text
-V1：现在
-一个 Agent Service + 一个 AsyncCodex + PostgreSQL + 持久化 CODEX_HOME
-
-V2：单 Runtime 真到瓶颈
-API 和 Runtime 拆开 + 多 Runtime + runtime_slot + 每个 Runtime 独立持久盘 + Redis Lock
-
-V3：业务再扩大
-多 API、副本自动扩容、托管 PostgreSQL / Redis、OTel、告警、压测和容量规划
-```
-
-关键结论：
-
-> **用户多，是单 Agent 的扩容问题；Agent 多，才是多 Agent 平台问题。**
-
-## 为什么现在没有向量数据库和图数据库？
-
-因为当前订单 Agent 的主要事实来自实时业务系统，而不是海量非结构化知识。
-
-例如用户问：
-
-> “订单 1001 到哪了？”
-
-最正确的数据源是：
-
-```text
-get_order_status
+“订单 1001 到哪了？”
+→ get_order_status
 → OMS
 ```
 
-而不是先去向量数据库搜索“订单 1001”。
+不应该用向量数据库搜索实时订单状态。
 
-所以当前 Agent 的核心知识来源是：
-
-```text
-Skill
-→ 告诉 Agent 售后 SOP 和做事规则
-
-MCP / Tool
-→ 获取实时订单事实、执行真实业务动作
-
-Codex Thread / Context
-→ 保存当前会话上下文
-```
-
-这三个已经覆盖当前订单 Agent 的主要需求。
-
-### 什么时候才需要向量数据库？
-
-术语：`Vector Database`，向量数据库。
-
-可以把它理解成：
-
-> 当公司有很多文档，而用户的问题不适合精确 SQL 查询时，用“语义相似度”从大量文档里找最相关片段。
-
-例如以后售后 Agent 要回答：
+以后如果 Agent 需要从几千份售后政策、说明书、FAQ 中按语义找知识，再增加：
 
 ```text
-“这款产品进水后还保修吗？”
-“海外订单的退货期限是多少？”
-“去年双十一活动购买的商品适用哪个售后规则？”
+Knowledge MCP
+→ RAG
+→ Vector DB（例如 Milvus）
 ```
 
-公司可能有：
+如果业务重点变成实体关系查询，例如用户—设备—银行卡—商户或订单—批次—供应商—质检事件，再考虑 Graph DB。
+
+Codex Harness 不替代这些数据库；它只负责 Agent 怎么运行。数据库按业务需要通过 Tool / MCP 暴露给 Agent。
+
+## Evals：正式接入 LangSmith
+
+`cases.jsonl + run.py` 不再承担完整 Eval Platform 职责。现在正式结构是：
 
 ```text
-5000 页售后政策
-产品说明书
-活动规则
-FAQ
-内部 SOP
+人工 Golden / Seed
+生产失败 Case
+人工标注 Case
+合成变体
+        ↓
+LangSmith Dataset（版本化题库）
+        ↓
+LangSmithAgentTarget
+        ↓
+真实 Codex Agent HTTP/SSE
+        ↓
+Tool / Approval / Answer
+        ↓
+Evaluators
+        ↓
+Experiment
 ```
 
-这时候可以增加：
+当前 Evaluator 包括：
 
 ```text
-文档
- ↓
-切片 + Embedding
- ↓
-Vector DB
- ↓
-knowledge_search Tool / MCP
- ↓
-Codex
+tool_policy
+→ Tool 是否选对
+
+approval_policy
+→ 风险动作是否正确触发 Approval
+
+response_contract
+→ 最低业务回答契约 / 敏感信息泄露
+
+business_quality（可选 LLM Judge）
+→ 事实性、边界、回答质量
 ```
 
-也就是说，向量数据库不是 Harness 必需组件，而是某个 Agent 出现“海量语义知识检索”需求时新增的一种 Tool 后端。
+详细使用说明见：`codex-agent-python/evals/README.md`。
 
-### 什么时候才需要图数据库？
+核心原则：
 
-术语：`Graph Database`，图数据库。
+> 能确定性判断的安全规则，不交给 LLM Judge；主观质量才使用 LLM-as-a-Judge。
 
-可以理解成：
+LangSmith 负责 Dataset、版本、Experiment 和结果比较；Agent 仍然是 Codex Harness，不需要改成 LangChain Agent。
 
-> 当问题重点不是“哪段文字最像”，而是“实体之间有复杂关系，需要沿关系查询和推理”。
+## 当前还不是完全生产就绪的地方
 
-例如风控 Agent：
+专家审计后的 P0 缺口是：
 
 ```text
-用户 A
-→ 使用手机号 X
-→ 关联设备 D
-→ 设备 D 又登录过用户 B
-→ 用户 B 关联商户 M
-→ 商户 M 已被标记高风险
+1. 同 Conversation 串行锁
+2. 全局 Agent Turn 并发限制 / 背压
+3. cancel_order 等写 Tool 的端到端幂等
+4. 每个 Tool 的 timeout / retry / degradation policy
+5. 从 shared secret + trusted headers 升级到正式身份边界
+6. Secret Manager / 密钥轮换
+7. CODEX_HOME 持久卷 + crash recovery 实际演练
+8. Java MCP Adapter CI 清零
 ```
 
-这种问题很适合图数据库。
-
-或者供应链 Agent：
+P1 包括：
 
 ```text
-订单
-→ 商品
-→ 供应商
-→ 工厂
-→ 批次
-→ 质检记录
-→ 召回事件
+LangSmith Eval 发布门禁
+SLO / Alert / 成本指标
+Graceful shutdown / draining
+PostgreSQL backup / restore
+SSE 断线与反向代理验证
+PII / Trace 脱敏策略
 ```
 
-如果经常问：
+多 Runtime + `runtime_slot` 属于容量真的达到瓶颈后的 P2，不提前实现。
 
-> “这个异常订单和哪些供应商、批次、历史事故有关？”
-
-图数据库会比单纯向量检索更自然。
-
-### Harness 和这些数据库是什么关系？
-
-Codex Harness 不要求一定使用：
-
-```text
-Vector DB
-Graph DB
-Redis
-Elasticsearch
-```
-
-Harness 负责的是：
-
-```text
-Agent 怎么思考和运行
-Thread / Turn
-Context
-Tool Dispatch
-Sandbox
-Compaction
-```
-
-而外部数据库属于“Agent 能访问什么能力”。
-
-通常通过 Tool / MCP 暴露：
-
-```text
-Codex Harness
-      │
-      ├── order_mcp → OMS
-      ├── knowledge_mcp → Vector DB
-      └── relation_mcp → Graph DB
-```
-
-所以不是“有了 Harness 就不需要向量数据库/图数据库”，而是：
-
-> **Harness 不替代数据库；只有业务真的需要某类数据检索时，才把相应数据库通过 Tool/MCP 接给 Agent。**
-
-## `hanress-test/`
-
-当前只作为 **Order MCP Adapter**：
-
-```text
-MCP Tool
-→ OrderService
-→ OrderGateway
-→ Real OMS
-```
-
-Java 不运行第二套 Codex Runtime，也不维护虚假订单状态。
+完整原因、风险和处理方案见：`codex-agent-python/docs/PRODUCTION_READINESS.md`。
 
 ## 当前明确不做
 
@@ -523,8 +229,6 @@ Java 不运行第二套 Codex Runtime，也不维护虚假订单状态。
 Agent Registry
 多 Agent Control Plane
 Runtime Scheduler
-Runtime Lease
-Runtime Router
 Agent Marketplace
 统一 Agent Gateway
 自研 Agent Loop
@@ -532,4 +236,4 @@ Agent Marketplace
 自研 Observability Platform
 ```
 
-等真正出现多个 Agent、多个团队、统一 MCP/LLM 治理等需求时，再从真实重复能力中抽平台层。
+我们的目标不是把一个 Agent 做成平台，而是把这个 Agent 的 Skill、Tool、Policy、Evals 和生产安全闭环真正做到可靠。
