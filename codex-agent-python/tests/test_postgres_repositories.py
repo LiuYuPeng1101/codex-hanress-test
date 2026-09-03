@@ -19,7 +19,7 @@ def _database_url() -> str:
 def test_conversation_lease_and_approval_tenant_isolation() -> None:
     database_url = _database_url()
     conversations = ConversationRepository(database_url)
-    approvals = ApprovalRepository(database_url, poll_interval_seconds=0.01)
+    approvals = ApprovalRepository(database_url)
 
     runtime_thread_id = f"thread-{uuid.uuid4()}"
     conversation_id = str(uuid.uuid4())
@@ -75,14 +75,19 @@ def test_conversation_lease_and_approval_tenant_isolation() -> None:
             user_id="user-1",
         )
 
-    approval = approvals.create(
+    approval_key = uuid.uuid4().hex
+    approval = approvals.create_pending(
         "mcpServer/elicitation/request",
         {
             "threadId": runtime_thread_id,
             "turnId": "turn-1",
             "serverName": "order",
-            "meta": {"codex_approval_kind": "mcp_tool_call"},
+            "_meta": {
+                "codex_approval_kind": "mcp_tool_call",
+                "tool_params": {"orderId": "88201"},
+            },
         },
+        approval_key=approval_key,
         conversation_id=conversation.id,
         requester_user_id="user-1",
         tenant_id="tenant-a",
@@ -107,6 +112,12 @@ def test_conversation_lease_and_approval_tenant_isolation() -> None:
     )
     assert approved.status == "APPROVED"
     assert approved.decided_by == "approver-a"
+
+    consumed = approvals.consume_approved_grant(approval.id)
+    assert consumed is not None
+    assert consumed.status == "CONSUMED"
+    assert consumed.consumed_at is not None
+    assert approvals.consume_approved_grant(approval.id) is None
 
     approvals.close()
     conversations.close()
