@@ -33,9 +33,8 @@ def list_approvals(
     service: Annotated[ApprovalService, Depends(get_approval_service)],
     principal: Annotated[ServicePrincipal, Depends(require_approval_principal)],
 ) -> ApprovalListResponse:
-    return ApprovalListResponse(
-        items=[_to_response(item) for item in service.list_approvals(tenant_id=principal.tenant_id)]
-    )
+    items = service.list_approvals(tenant_id=principal.tenant_id)
+    return ApprovalListResponse(items=[_to_response(item) for item in items])
 
 
 @router.post("/{approval_id}/approve", response_model=ApprovalResponse)
