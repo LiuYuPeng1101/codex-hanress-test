@@ -6,16 +6,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Agent Service 生产运行配置。
-
-    关键依赖必须显式配置；缺失配置时启动失败，不使用虚假数据或隐式降级。
-    """
+    """Agent Service 生产运行配置。"""
 
     app_name: str = "Codex Agent Service"
     app_env: str = "production"
     api_prefix: str = "/api/v1"
     agent_workspace: Path = Path(".")
     agent_id: str = "order-agent"
+
     runtime_instance_id: str = Field(description="当前 Runtime Worker 唯一标识")
     runtime_lease_seconds: int = Field(default=30, ge=10, le=300)
     codex_home: Path = Field(description="Codex 持久化目录；生产环境必须挂载可恢复的持久存储")
@@ -23,10 +21,10 @@ class Settings(BaseSettings):
     agentgateway_order_mcp_url: str = Field(
         description="订单 MCP 经 agentgateway 暴露的受治理入口；禁止直连真实 MCP Adapter"
     )
-    runtime_identity_signing_key: str = Field(
-        min_length=32,
-        description="Agent Service 给 Runtime 出站请求签发短期内部 JWT 的密钥",
+    runtime_identity_private_key_path: Path = Field(
+        description="签发 Runtime 短期内部 JWT 的 RSA 私钥路径"
     )
+    runtime_identity_key_id: str = "runtime-key-1"
     runtime_identity_issuer: str = "agent-control-plane"
     runtime_identity_audience: str = "agentgateway"
     runtime_identity_ttl_seconds: int = Field(default=300, ge=30, le=900)
