@@ -16,14 +16,21 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
     agent_workspace: Path = Path(".")
     agent_id: str = "order-agent"
-    runtime_instance_id: str = Field(description="当前 Runtime 实例唯一标识，用于 Thread 路由")
-    codex_home: Path = Field(description="Codex 持久化目录；生产环境必须挂载持久卷")
+    runtime_instance_id: str = Field(description="当前 Runtime Worker 唯一标识")
+    runtime_lease_seconds: int = Field(default=30, ge=10, le=300)
+    codex_home: Path = Field(description="Codex 持久化目录；生产环境必须挂载可恢复的持久存储")
 
-    order_mcp_url: str = Field(description="订单 MCP Adapter 地址")
-    order_mcp_service_token: str = Field(
-        min_length=32,
-        description="Agent Runtime 调用订单 MCP Adapter 的服务认证密钥",
+    agentgateway_order_mcp_url: str = Field(
+        description="订单 MCP 经 agentgateway 暴露的受治理入口；禁止直连真实 MCP Adapter"
     )
+    runtime_identity_signing_key: str = Field(
+        min_length=32,
+        description="Agent Service 给 Runtime 出站请求签发短期内部 JWT 的密钥",
+    )
+    runtime_identity_issuer: str = "agent-control-plane"
+    runtime_identity_audience: str = "agentgateway"
+    runtime_identity_ttl_seconds: int = Field(default=300, ge=30, le=900)
+
     database_url: str = Field(description="PostgreSQL 连接串")
     gateway_shared_secret: str = Field(
         min_length=32,
