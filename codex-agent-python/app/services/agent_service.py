@@ -55,7 +55,11 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> dict[str, Any]:
-        conversation = self._resolve_owned(conversation_id, tenant_id=tenant_id, user_id=user_id)
+        conversation = self._resolve_owned(
+            conversation_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
         return await self._runtime.read_thread(
             conversation.runtime_thread_id,
             user_id=user_id,
@@ -71,7 +75,11 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> None:
-        conversation = self._resolve_owned(conversation_id, tenant_id=tenant_id, user_id=user_id)
+        conversation = self._resolve_owned(
+            conversation_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
         await self._runtime.compact_thread(
             conversation.runtime_thread_id,
             user_id=user_id,
@@ -88,7 +96,11 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> str:
-        conversation = self._resolve_owned(conversation_id, tenant_id=tenant_id, user_id=user_id)
+        conversation = self._resolve_owned(
+            conversation_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
         return await self._runtime.run_turn(
             conversation.runtime_thread_id,
             conversation.id,
@@ -107,7 +119,11 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> AsyncIterator[AgentEvent]:
-        conversation = self._resolve_owned(conversation_id, tenant_id=tenant_id, user_id=user_id)
+        conversation = self._resolve_owned(
+            conversation_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
         async for event in self._runtime.stream_turn(
             conversation.runtime_thread_id,
             conversation.id,
@@ -118,7 +134,13 @@ class AgentService:
         ):
             yield event
 
-    def _resolve_owned(self, conversation_id: str, *, tenant_id: str, user_id: str) -> Conversation:
+    def _resolve_owned(
+        self,
+        conversation_id: str,
+        *,
+        tenant_id: str,
+        user_id: str,
+    ) -> Conversation:
         return self._conversations.get_owned(
             conversation_id,
             tenant_id=tenant_id,
