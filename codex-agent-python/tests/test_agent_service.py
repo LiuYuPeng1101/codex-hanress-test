@@ -1,13 +1,14 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from app.conversations.conversation_repository import Conversation
-from app.services.agent_service import AgentService, RuntimeOwnershipError
+from app.services.agent_service import AgentService, RuntimeLeaseConflict
 
 
-def _conversation(instance_id: str = "runtime-01") -> Conversation:
+def _conversation(owner: str = "runtime-01") -> Conversation:
+    now = datetime.now(timezone.utc)
     return Conversation(
         id="conversation-1",
         agent_id="order-agent",
@@ -15,8 +16,20 @@ def _conversation(instance_id: str = "runtime-01") -> Conversation:
         user_id="user-1",
         runtime_type="codex",
         runtime_thread_id="thread-1",
-        runtime_instance_id=instance_id,
-        created_at=datetime.now(timezone.utc),
+        runtime_lease_owner=owner,
+        runtime_lease_expires_at=now + timedelta(seconds=30),
+        runtime_generation=1,
+        created_at=now,
+    )
+
+
+def _service(runtime: Mock, conversations: Mock) -> AgentService:
+    return AgentService(
+        runtime,
+        conversations,
+        agent_id="order-agent",
+        runtime_instance_id="runtime-01",
+        runtime_lease_seconds=30,
     )
 
 
@@ -26,13 +39,9 @@ async def test_create_conversation_persists_runtime_mapping() -> None:
     runtime.create_thread = AsyncMock(return_value="thread-1")
     runtime.archive_thread = AsyncMock()
     conversations = Mock()
+    conversations.new_id.return_value = "conversation-1"
     conversations.create.return_value = _conversation()
-    service = AgentService(
-        runtime,
-        conversations,
-        agent_id="order-agent",
-        runtime_instance_id="runtime-01",
-    )
+    service = _service(runtime, conversations)
 
     created = await service.create_conversation(
         tenant_id="tenant-a",
@@ -42,17 +51,20 @@ async def test_create_conversation_persists_runtime_mapping() -> None:
 
     assert created.id == "conversation-1"
     runtime.create_thread.assert_awaited_once_with(
+        conversation_id="conversation-1",
         user_id="user-1",
         tenant_id="tenant-a",
         roles=frozenset({"support.agent"}),
     )
     conversations.create.assert_called_once_with(
+        conversation_id="conversation-1",
         agent_id="order-agent",
         tenant_id="tenant-a",
         user_id="user-1",
         runtime_type="codex",
         runtime_thread_id="thread-1",
         runtime_instance_id="runtime-01",
+        lease_seconds=30,
     )
 
 
@@ -62,13 +74,9 @@ async def test_orphan_thread_is_archived_when_mapping_fails() -> None:
     runtime.create_thread = AsyncMock(return_value="thread-orphan")
     runtime.archive_thread = AsyncMock()
     conversations = Mock()
+    conversations.new_id.return_value = "conversation-1"
     conversations.create.side_effect = RuntimeError("db unavailable")
-    service = AgentService(
-        runtime,
-        conversations,
-        agent_id="order-agent",
-        runtime_instance_id="runtime-01",
-    )
+    service = _service(runtime, conversations)
 
     with pytest.raises(RuntimeError, match="db unavailable"):
         await service.create_conversation(
@@ -81,19 +89,15 @@ async def test_orphan_thread_is_archived_when_mapping_fails() -> None:
 
 
 @pytest.mark.asyncio
-async def test_wrong_runtime_instance_requires_sticky_routing() -> None:
+async def test_unexpired_lease_blocks_second_worker() -> None:
     runtime = Mock()
     runtime.run_turn = AsyncMock()
     conversations = Mock()
-    conversations.get_owned.return_value = _conversation(instance_id="runtime-02")
-    service = AgentService(
-        runtime,
-        conversations,
-        agent_id="order-agent",
-        runtime_instance_id="runtime-01",
-    )
+    conversations.get_owned.return_value = _conversation(owner="runtime-02")
+    conversations.acquire_lease.return_value = None
+    service = _service(runtime, conversations)
 
-    with pytest.raises(RuntimeOwnershipError) as exc_info:
+    with pytest.raises(RuntimeLeaseConflict) as exc_info:
         await service.chat(
             "conversation-1",
             "查询订单",
@@ -102,22 +106,18 @@ async def test_wrong_runtime_instance_requires_sticky_routing() -> None:
             roles=frozenset(),
         )
 
-    assert exc_info.value.expected_instance_id == "runtime-02"
+    assert exc_info.value.owner == "runtime-02"
     runtime.run_turn.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_current_roles_are_reinjected_on_each_turn() -> None:
+async def test_expired_lease_can_be_taken_over_and_current_roles_reinjected() -> None:
     runtime = Mock()
     runtime.run_turn = AsyncMock(return_value="ok")
     conversations = Mock()
-    conversations.get_owned.return_value = _conversation()
-    service = AgentService(
-        runtime,
-        conversations,
-        agent_id="order-agent",
-        runtime_instance_id="runtime-01",
-    )
+    conversations.get_owned.return_value = _conversation(owner="runtime-02")
+    conversations.acquire_lease.return_value = _conversation(owner="runtime-01")
+    service = _service(runtime, conversations)
 
     result = await service.chat(
         "conversation-1",
