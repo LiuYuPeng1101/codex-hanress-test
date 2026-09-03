@@ -17,20 +17,30 @@ from app.security.gateway_auth import (
     require_gateway_principal,
     require_operator_principal,
 )
-from app.services.agent_service import AgentService, RuntimeOwnershipError
+from app.services.agent_service import (
+    AgentService,
+    RuntimeLeaseConflict,
+    RuntimeLeaseLost,
+)
 
 router = APIRouter(prefix="/agents", tags=["Agent"])
 
 
-def _runtime_route_error(exc: RuntimeOwnershipError) -> HTTPException:
-    """把 Runtime 粘性路由要求转换成 Gateway 可处理的冲突响应。"""
-
+def _runtime_lease_error(exc: RuntimeLeaseConflict) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail={
-            "code": "RUNTIME_INSTANCE_MISMATCH",
-            "expected_runtime_instance_id": exc.expected_instance_id,
+            "code": "RUNTIME_LEASE_HELD",
+            "owner": exc.owner,
+            "lease_expires_at": exc.expires_at.isoformat(),
         },
+    )
+
+
+def _runtime_lease_lost_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"code": "RUNTIME_LEASE_LOST"},
     )
 
 
@@ -53,8 +63,6 @@ async def read_conversation(
     service: Annotated[AgentService, Depends(get_agent_service)],
     principal: Annotated[GatewayPrincipal, Depends(require_operator_principal)],
 ) -> ConversationReadResponse:
-    """读取 Runtime 原始诊断快照，仅允许 Agent Runtime 运维角色访问。"""
-
     try:
         snapshot = await service.read_conversation(
             conversation_id,
@@ -64,8 +72,10 @@ async def read_conversation(
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
-    except RuntimeOwnershipError as exc:
-        raise _runtime_route_error(exc) from exc
+    except RuntimeLeaseConflict as exc:
+        raise _runtime_lease_error(exc) from exc
+    except RuntimeLeaseLost as exc:
+        raise _runtime_lease_lost_error() from exc
     return ConversationReadResponse(
         conversation_id=conversation_id,
         runtime_snapshot=snapshot,
@@ -81,8 +91,6 @@ async def compact_conversation(
     service: Annotated[AgentService, Depends(get_agent_service)],
     principal: Annotated[GatewayPrincipal, Depends(require_operator_principal)],
 ) -> CompactConversationResponse:
-    """人工触发 Context Compaction，仅允许 Runtime 运维角色。"""
-
     try:
         await service.compact_conversation(
             conversation_id,
@@ -92,8 +100,10 @@ async def compact_conversation(
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
-    except RuntimeOwnershipError as exc:
-        raise _runtime_route_error(exc) from exc
+    except RuntimeLeaseConflict as exc:
+        raise _runtime_lease_error(exc) from exc
+    except RuntimeLeaseLost as exc:
+        raise _runtime_lease_lost_error() from exc
     return CompactConversationResponse(
         conversation_id=conversation_id,
         status="COMPACTION_STARTED",
@@ -117,8 +127,10 @@ async def run_turn(
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
-    except RuntimeOwnershipError as exc:
-        raise _runtime_route_error(exc) from exc
+    except RuntimeLeaseConflict as exc:
+        raise _runtime_lease_error(exc) from exc
+    except RuntimeLeaseLost as exc:
+        raise _runtime_lease_lost_error() from exc
     return RunTurnResponse(conversation_id=conversation_id, answer=answer)
 
 
@@ -145,14 +157,18 @@ async def stream_turn(
         except KeyError:
             payload = json.dumps({"code": "CONVERSATION_NOT_FOUND"}, ensure_ascii=False)
             yield f"event: error\ndata: {payload}\n\n"
-        except RuntimeOwnershipError as exc:
+        except RuntimeLeaseConflict as exc:
             payload = json.dumps(
                 {
-                    "code": "RUNTIME_INSTANCE_MISMATCH",
-                    "expected_runtime_instance_id": exc.expected_instance_id,
+                    "code": "RUNTIME_LEASE_HELD",
+                    "owner": exc.owner,
+                    "lease_expires_at": exc.expires_at.isoformat(),
                 },
                 ensure_ascii=False,
             )
+            yield f"event: error\ndata: {payload}\n\n"
+        except RuntimeLeaseLost:
+            payload = json.dumps({"code": "RUNTIME_LEASE_LOST"}, ensure_ascii=False)
             yield f"event: error\ndata: {payload}\n\n"
 
     return StreamingResponse(

@@ -17,13 +17,14 @@ from app.agents.definition import AgentDefinition, SandboxPolicy
 from app.events.codex_event_mapper import CodexEventMapper
 from app.events.models import AgentEvent
 from app.observability.tracing import get_tracer
+from app.security.runtime_identity import RuntimeIdentityIssuer
 
 
 class CodexRuntime:
     """把企业 AgentDefinition 适配到官方 Codex Harness。
 
-    这一层不包含订单、合同、财务等业务名词。它负责把控制面定义翻译成 Codex 的：
-    Thread、MCP 配置、Tool allow-list、Approval Policy、Sandbox、Event 与 Context 生命周期。
+    Codex Harness 仍负责 Thread、Turn、Context、Compaction、Sandbox 与 Tool Loop；
+    但 LLM / MCP 网络出口都被改写到 agentgateway。Runtime 不持有 OpenAI/MCP 后端凭证。
     """
 
     def __init__(
@@ -31,10 +32,12 @@ class CodexRuntime:
         definition: AgentDefinition,
         codex_home: Path,
         approval_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
+        runtime_identity_issuer: RuntimeIdentityIssuer,
     ) -> None:
         self._definition = definition
         self._workspace = Path(definition.workspace).resolve()
         self._codex_home = codex_home.resolve()
+        self._runtime_identity_issuer = runtime_identity_issuer
         self._event_mapper = CodexEventMapper()
         self._tracer = get_tracer()
 
@@ -48,7 +51,7 @@ class CodexRuntime:
         self._codex = AsyncCodex(
             config=CodexConfig(
                 env=runtime_env,
-                config_overrides=self._build_mcp_config_overrides(),
+                config_overrides=self._build_runtime_config_overrides(),
             )
         )
 
@@ -76,18 +79,22 @@ class CodexRuntime:
     async def create_thread(
         self,
         *,
+        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> str:
-        """创建带人工 reviewer、最小 Sandbox 与可信 MCP 身份的 Codex Thread。"""
-
         self._ensure_started()
         params = ThreadStartParams(
             approval_policy=AskForApproval(root=AskForApprovalValue.on_request),
             approvals_reviewer=ApprovalsReviewer.user,
             sandbox=self._sandbox_mode(),
-            config=self._mcp_identity_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
+            config=self._gateway_identity_config(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
+            ),
             cwd=str(self._workspace),
         )
         started = await self._codex._client.thread_start(params)
@@ -101,12 +108,14 @@ class CodexRuntime:
         self,
         thread_id: str,
         *,
+        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> dict[str, Any]:
         thread = await self._resume_thread(
             thread_id,
+            conversation_id=conversation_id,
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
@@ -118,12 +127,14 @@ class CodexRuntime:
         self,
         thread_id: str,
         *,
+        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> None:
         thread = await self._resume_thread(
             thread_id,
+            conversation_id=conversation_id,
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
@@ -146,6 +157,7 @@ class CodexRuntime:
 
             thread = await self._resume_thread(
                 thread_id,
+                conversation_id=conversation_id,
                 user_id=user_id,
                 tenant_id=tenant_id,
                 roles=roles,
@@ -170,6 +182,7 @@ class CodexRuntime:
     ) -> AsyncIterator[AgentEvent]:
         thread = await self._resume_thread(
             thread_id,
+            conversation_id=conversation_id,
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
@@ -201,22 +214,40 @@ class CodexRuntime:
         self,
         thread_id: str,
         *,
+        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> AsyncThread:
-        """恢复 Thread 时重新注入当前可信身份，避免长期会话沿用过期角色。"""
+        """恢复 Thread 时重新签发短期身份，避免长期会话沿用过期权限。"""
 
         self._ensure_started()
         return await self._codex.thread_resume(
             thread_id,
             cwd=str(self._workspace),
             sandbox=self._sandbox(),
-            config=self._mcp_identity_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
+            config=self._gateway_identity_config(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
+            ),
         )
 
-    def _build_mcp_config_overrides(self) -> tuple[str, ...]:
-        overrides: list[str] = []
+    def _build_runtime_config_overrides(self) -> tuple[str, ...]:
+        """启动 Codex 时固定所有网络型能力的逻辑出口。"""
+
+        model_gateway = self._definition.model_gateway
+        provider = f"model_providers.{model_gateway.provider_id}"
+        overrides: list[str] = [
+            f"model_provider={json.dumps(model_gateway.provider_id)}",
+            f"model={json.dumps(model_gateway.model)}",
+            f"{provider}.name={json.dumps('Agent Gateway')}",
+            f"{provider}.base_url={json.dumps(model_gateway.base_url)}",
+            f"{provider}.wire_api={json.dumps('responses')}",
+            f"{provider}.requires_openai_auth=false",
+        ]
+
         for server in self._definition.mcp_servers:
             prefix = f"mcp_servers.{server.name}"
             overrides.extend(
@@ -232,22 +263,32 @@ class CodexRuntime:
                 )
         return tuple(overrides)
 
-    def _mcp_identity_config(
+    def _gateway_identity_config(
         self,
         *,
+        conversation_id: str,
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
     ) -> dict[str, Any]:
-        """把可信身份放入每个 MCP Server 的 HTTP Header，而不是 Tool 参数。"""
+        """同一短期内部 JWT 同时标识本 Turn 的 LLM 与 MCP 出站身份。"""
 
-        config: dict[str, Any] = {}
+        token = self._runtime_identity_issuer.issue(
+            user_id=user_id,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            agent_id=self._definition.agent_id,
+            roles=roles,
+        )
+        authorization = f"Bearer {token}"
+        config: dict[str, Any] = {
+            f"model_providers.{self._definition.model_gateway.provider_id}.http_headers": {
+                "Authorization": authorization,
+            }
+        }
         for server in self._definition.mcp_servers:
             config[f"mcp_servers.{server.name}.http_headers"] = {
-                "Authorization": f"Bearer {server.service_token}",
-                "X-User-Id": user_id,
-                "X-Tenant-Id": tenant_id,
-                "X-Roles": ",".join(sorted(roles)),
+                "Authorization": authorization,
             }
         return config
 

@@ -13,12 +13,36 @@ class SandboxPolicy(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ModelGatewayDefinition:
+    """Agent 使用的模型出口。
+
+    `base_url` 必须指向 agentgateway 的 OpenAI-compatible `/v1` 入口。
+    Runtime 不持有模型提供商 API Key。
+    """
+
+    base_url: str
+    model: str
+    provider_id: str = "agentgateway"
+
+    def __post_init__(self) -> None:
+        if not self.base_url:
+            raise ValueError("Model Gateway base_url 不能为空")
+        if not self.model:
+            raise ValueError("model 不能为空")
+        if not self.provider_id.replace("_", "").replace("-", "").isalnum():
+            raise ValueError("provider_id 只能包含字母、数字、_、-")
+
+
+@dataclass(frozen=True, slots=True)
 class McpServerDefinition:
-    """一个 Agent 可使用的 MCP Server 及其 Tool 治理策略。"""
+    """Agent 通过 agentgateway 访问的一个逻辑 MCP Server。
+
+    `url` 必须指向 agentgateway 的受治理入口，而不是真实 MCP 后端地址。
+    Runtime 不保存真实后端 token；真实 credential 由 agentgateway backendAuth 管理。
+    """
 
     name: str
     url: str
-    service_token: str
     enabled_tools: tuple[str, ...]
     tool_approval_modes: tuple[tuple[str, str], ...]
     default_approval_mode: str = "approve"
@@ -28,8 +52,6 @@ class McpServerDefinition:
             raise ValueError("MCP Server name 只能包含字母、数字、_、-")
         if not self.url:
             raise ValueError("MCP Server url 不能为空")
-        if len(self.service_token) < 32:
-            raise ValueError("MCP Server service_token 至少 32 字符")
         if not self.enabled_tools:
             raise ValueError("MCP Server 至少需要暴露一个 Tool")
 
@@ -59,6 +81,7 @@ class AgentDefinition:
     agent_id: str
     workspace: str
     sandbox: SandboxPolicy
+    model_gateway: ModelGatewayDefinition
     mcp_servers: tuple[McpServerDefinition, ...]
 
     def __post_init__(self) -> None:
