@@ -18,6 +18,7 @@ class McpServerDefinition:
 
     name: str
     url: str
+    service_token: str
     enabled_tools: tuple[str, ...]
     tool_approval_modes: tuple[tuple[str, str], ...]
     default_approval_mode: str = "approve"
@@ -27,6 +28,8 @@ class McpServerDefinition:
             raise ValueError("MCP Server name 只能包含字母、数字、_、-")
         if not self.url:
             raise ValueError("MCP Server url 不能为空")
+        if len(self.service_token) < 32:
+            raise ValueError("MCP service_token 至少 32 字符")
         if not self.enabled_tools:
             raise ValueError("MCP Server 至少需要暴露一个 Tool")
 
@@ -46,7 +49,7 @@ class McpServerDefinition:
 class AgentDefinition:
     """当前唯一业务 Agent 的运行定义。
 
-    这里只有内容层和最小运行策略：workspace、sandbox、MCP、Tool Policy。
+    这里只描述内容层和最小运行策略：workspace、sandbox、MCP、Tool Policy。
     不承担 Agent Registry、Runtime Router 或多 Agent Control Plane 职责。
     """
 
