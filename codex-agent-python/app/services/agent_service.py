@@ -1,4 +1,8 @@
+from __future__ import annotations
+
+import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from typing import Any
 
@@ -16,12 +20,15 @@ class RuntimeLeaseConflict(RuntimeError):
         self.expires_at = expires_at
 
 
+class RuntimeLeaseLost(RuntimeError):
+    """当前 Worker 在执行过程中失去了 Conversation lease。"""
+
+
 class AgentService:
     """企业 Agent 应用服务。
 
-    外部只处理 business conversation_id。每次执行前原子续租或接管 Runtime lease；
-    因此 Worker 实例不是永久归属。真正能否在新 Worker 恢复 Thread，取决于 CODEX_HOME
-    是否部署在可恢复的持久存储上。
+    外部只处理 business conversation_id。每次执行前原子获取 lease，执行期间持续 heartbeat；
+    Worker 实例不是永久归属。实际故障接管仍依赖可恢复的 CODEX_HOME / Runtime Storage。
     """
 
     def __init__(
@@ -38,6 +45,7 @@ class AgentService:
         self._agent_id = agent_id
         self._runtime_instance_id = runtime_instance_id
         self._runtime_lease_seconds = runtime_lease_seconds
+        self._heartbeat_interval_seconds = max(1.0, runtime_lease_seconds / 3)
 
     async def create_conversation(
         self,
@@ -54,7 +62,8 @@ class AgentService:
             roles=roles,
         )
         try:
-            return self._conversations.create(
+            return await asyncio.to_thread(
+                self._conversations.create,
                 conversation_id=conversation_id,
                 agent_id=self._agent_id,
                 tenant_id=tenant_id,
@@ -78,16 +87,17 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> dict[str, Any]:
-        conversation = self._resolve_and_acquire(
+        conversation = await self._resolve_and_acquire(
             conversation_id, tenant_id=tenant_id, user_id=user_id
         )
-        return await self._runtime.read_thread(
-            conversation.runtime_thread_id,
-            conversation_id=conversation.id,
-            user_id=user_id,
-            tenant_id=tenant_id,
-            roles=roles,
-        )
+        async with self._lease_guard(conversation):
+            return await self._runtime.read_thread(
+                conversation.runtime_thread_id,
+                conversation_id=conversation.id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
+            )
 
     async def compact_conversation(
         self,
@@ -97,16 +107,17 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> None:
-        conversation = self._resolve_and_acquire(
+        conversation = await self._resolve_and_acquire(
             conversation_id, tenant_id=tenant_id, user_id=user_id
         )
-        await self._runtime.compact_thread(
-            conversation.runtime_thread_id,
-            conversation_id=conversation.id,
-            user_id=user_id,
-            tenant_id=tenant_id,
-            roles=roles,
-        )
+        async with self._lease_guard(conversation):
+            await self._runtime.compact_thread(
+                conversation.runtime_thread_id,
+                conversation_id=conversation.id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
+            )
 
     async def chat(
         self,
@@ -117,17 +128,18 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> str:
-        conversation = self._resolve_and_acquire(
+        conversation = await self._resolve_and_acquire(
             conversation_id, tenant_id=tenant_id, user_id=user_id
         )
-        return await self._runtime.run_turn(
-            conversation.runtime_thread_id,
-            conversation.id,
-            message,
-            user_id=user_id,
-            tenant_id=tenant_id,
-            roles=roles,
-        )
+        async with self._lease_guard(conversation):
+            return await self._runtime.run_turn(
+                conversation.runtime_thread_id,
+                conversation.id,
+                message,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
+            )
 
     async def stream_chat(
         self,
@@ -138,27 +150,29 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> AsyncIterator[AgentEvent]:
-        conversation = self._resolve_and_acquire(
+        conversation = await self._resolve_and_acquire(
             conversation_id, tenant_id=tenant_id, user_id=user_id
         )
-        async for event in self._runtime.stream_turn(
-            conversation.runtime_thread_id,
-            conversation.id,
-            message,
-            user_id=user_id,
-            tenant_id=tenant_id,
-            roles=roles,
-        ):
-            yield event
+        async with self._lease_guard(conversation):
+            async for event in self._runtime.stream_turn(
+                conversation.runtime_thread_id,
+                conversation.id,
+                message,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
+            ):
+                yield event
 
-    def _resolve_and_acquire(
+    async def _resolve_and_acquire(
         self,
         conversation_id: str,
         *,
         tenant_id: str,
         user_id: str,
     ) -> Conversation:
-        existing = self._conversations.get_owned(
+        existing = await asyncio.to_thread(
+            self._conversations.get_owned,
             conversation_id,
             tenant_id=tenant_id,
             user_id=user_id,
@@ -166,7 +180,8 @@ class AgentService:
         if existing.agent_id != self._agent_id or existing.runtime_type != "codex":
             raise RuntimeError("Conversation 与当前 Agent Runtime 不匹配")
 
-        leased = self._conversations.acquire_lease(
+        leased = await asyncio.to_thread(
+            self._conversations.acquire_lease,
             conversation_id,
             tenant_id=tenant_id,
             user_id=user_id,
@@ -179,3 +194,46 @@ class AgentService:
                 existing.runtime_lease_expires_at,
             )
         return leased
+
+    @asynccontextmanager
+    async def _lease_guard(self, conversation: Conversation):
+        """活跃 Turn 执行期间保持 lease，不允许另一个 Worker 在长请求中途接管。"""
+
+        stop = asyncio.Event()
+        lease_lost = asyncio.Event()
+        owner_task = asyncio.current_task()
+
+        async def heartbeat() -> None:
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(
+                        stop.wait(),
+                        timeout=self._heartbeat_interval_seconds,
+                    )
+                    return
+                except TimeoutError:
+                    renewed = await asyncio.to_thread(
+                        self._conversations.renew_lease,
+                        conversation.id,
+                        runtime_instance_id=self._runtime_instance_id,
+                        lease_seconds=self._runtime_lease_seconds,
+                    )
+                    if renewed:
+                        continue
+                    lease_lost.set()
+                    if owner_task is not None:
+                        owner_task.cancel()
+                    return
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
+            yield
+        except asyncio.CancelledError as exc:
+            if lease_lost.is_set():
+                raise RuntimeLeaseLost("活跃 Turn 的 Runtime lease 已丢失") from exc
+            raise
+        finally:
+            stop.set()
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
