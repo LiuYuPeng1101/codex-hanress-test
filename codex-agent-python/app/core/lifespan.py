@@ -3,7 +3,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.agents.definition import AgentDefinition, McpServerDefinition, SandboxPolicy
+from app.agents.definition import (
+    AgentDefinition,
+    McpServerDefinition,
+    ModelGatewayDefinition,
+    SandboxPolicy,
+)
 from app.approval.approval_repository import ApprovalRepository
 from app.approval.approval_service import ApprovalService
 from app.conversations.conversation_repository import ConversationRepository
@@ -47,6 +52,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         agent_id=settings.agent_id,
         workspace=str(settings.agent_workspace),
         sandbox=SandboxPolicy.READ_ONLY,
+        model_gateway=ModelGatewayDefinition(
+            base_url=settings.agentgateway_llm_base_url,
+            model=settings.codex_model,
+        ),
         mcp_servers=(
             McpServerDefinition(
                 name="order",
