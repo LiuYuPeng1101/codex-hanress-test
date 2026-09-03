@@ -39,7 +39,6 @@ class Settings(BaseSettings):
         min_length=32,
         description="企业 Gateway 调用 Agent Service 的服务认证密钥",
     )
-    approval_timeout_seconds: int = Field(default=900, ge=30, le=86400)
 
     otel_exporter_otlp_traces_endpoint: str | None = None
 
