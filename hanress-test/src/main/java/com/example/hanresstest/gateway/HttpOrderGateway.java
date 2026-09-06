@@ -44,8 +44,8 @@ public class HttpOrderGateway implements OrderGateway {
     public JsonNode cancelOrder(String orderId, BusinessIdentity identity, java.util.UUID executionId) {
         java.util.Objects.requireNonNull(executionId, "执行 ID 不能为空");
         return restClient.post()
-                .header("Idempotency-Key", executionId.toString())
                 .uri(properties.cancelPath(), orderId)
+                .header("Idempotency-Key", executionId.toString())
                 .headers(headers -> applyIdentity(headers, identity))
                 .retrieve()
                 .body(JsonNode.class);
