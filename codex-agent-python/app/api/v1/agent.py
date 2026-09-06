@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import get_agent_service
+from app.runtime.admission import AdmissionRejected, ExecutionFailed, RuntimeUnavailable
 from app.schemas.agent import (
     CompactConversationResponse,
     ConversationReadResponse,
@@ -27,11 +28,22 @@ async def create_conversation(
     service: Annotated[AgentService, Depends(get_agent_service)],
     principal: Annotated[ServicePrincipal, Depends(require_service_principal)],
 ) -> CreateConversationResponse:
-    conversation = await service.create_conversation(
-        tenant_id=principal.tenant_id,
-        user_id=principal.user_id,
-        roles=principal.roles,
-    )
+    try:
+        conversation = await service.create_conversation(
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            roles=principal.roles,
+        )
+    except AdmissionRejected as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code},
+            headers={"Retry-After": "1"},
+        ) from exc
+    except ExecutionFailed as exc:
+        raise HTTPException(status_code=502, detail={"code": "TURN_FAILED"}) from exc
+    except RuntimeUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"code": "RUNTIME_OUTCOME_UNKNOWN"}) from exc
     return CreateConversationResponse(conversation_id=conversation.id)
 
 
@@ -48,6 +60,16 @@ async def read_conversation(
             user_id=principal.user_id,
             roles=principal.roles,
         )
+    except AdmissionRejected as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code},
+            headers={"Retry-After": "1"},
+        ) from exc
+    except ExecutionFailed as exc:
+        raise HTTPException(status_code=502, detail={"code": "TURN_FAILED"}) from exc
+    except RuntimeUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"code": "RUNTIME_OUTCOME_UNKNOWN"}) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
     return ConversationReadResponse(
@@ -72,11 +94,21 @@ async def compact_conversation(
             user_id=principal.user_id,
             roles=principal.roles,
         )
+    except AdmissionRejected as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code},
+            headers={"Retry-After": "1"},
+        ) from exc
+    except ExecutionFailed as exc:
+        raise HTTPException(status_code=502, detail={"code": "TURN_FAILED"}) from exc
+    except RuntimeUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"code": "RUNTIME_OUTCOME_UNKNOWN"}) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
     return CompactConversationResponse(
         conversation_id=conversation_id,
-        status="COMPACTION_STARTED",
+        status="COMPACTION_COMPLETED",
     )
 
 
@@ -95,6 +127,16 @@ async def run_turn(
             user_id=principal.user_id,
             roles=principal.roles,
         )
+    except AdmissionRejected as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code},
+            headers={"Retry-After": "1"},
+        ) from exc
+    except ExecutionFailed as exc:
+        raise HTTPException(status_code=502, detail={"code": "TURN_FAILED"}) from exc
+    except RuntimeUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"code": "RUNTIME_OUTCOME_UNKNOWN"}) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
     return RunTurnResponse(conversation_id=conversation_id, answer=answer)
@@ -107,20 +149,30 @@ async def stream_turn(
     service: Annotated[AgentService, Depends(get_agent_service)],
     principal: Annotated[ServicePrincipal, Depends(require_service_principal)],
 ) -> StreamingResponse:
+    try:
+        subscription = await service.open_stream(
+            conversation_id,
+            request.message,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            roles=principal.roles,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Conversation 不存在") from exc
+    except AdmissionRejected as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code},
+            headers={"Retry-After": "1"},
+        ) from exc
+
     async def event_stream():
         try:
-            async for event in service.stream_chat(
-                conversation_id,
-                request.message,
-                tenant_id=principal.tenant_id,
-                user_id=principal.user_id,
-                roles=principal.roles,
-            ):
+            async for event in subscription.events():
                 payload = json.dumps(event.to_dict(), ensure_ascii=False)
                 yield f"event: {event.type}\ndata: {payload}\n\n"
-        except KeyError:
-            payload = json.dumps({"code": "CONVERSATION_NOT_FOUND"}, ensure_ascii=False)
-            yield f"event: error\ndata: {payload}\n\n"
+        finally:
+            subscription.aclose()
 
     return StreamingResponse(
         event_stream(),

@@ -102,7 +102,7 @@ export EVAL_JUDGE_MODEL="你的 OpenEvals model identifier"
 ## 第一步：导入 Seed Dataset
 
 ```bash
-python evals/seed_langsmith_dataset.py \
+python -m evals.seed_langsmith_dataset \
   --dataset codex-order-agent-seed
 ```
 
@@ -138,7 +138,7 @@ Codex Single Agent Service
 然后：
 
 ```bash
-python evals/run_langsmith.py \
+python -m evals.run_langsmith \
   --dataset codex-order-agent-seed \
   --experiment-prefix order-skill-v1
 ```
@@ -298,3 +298,14 @@ Approval 安全规则
 ```
 
 Codex Harness 继续负责 Agent 本身怎么运行。
+
+
+## 当前门禁与运行限制
+
+运行前先阅读 [可靠性说明](../docs/RELIABILITY.md)。CLI 等待实验结果，只有数据集非空、没有跳过/执行错误、每个例题的三个确定性评分都为 1 才返回 0。可选业务质量 Judge 展示为质量信号，目前不加入这个确定性门禁。
+
+缺少 `requires_fixture` 对应测试环境的题目仍明确跳过，不能凭剩余题目通过来宣称整个安全数据集通过。当前 Target 不自动部署或启用恶意订单 fixture。
+
+本地 smoke 命令为 `python -m evals.run`，它与 LangSmith 使用同一个 HTTP/SSE Target。必须设置 `EVAL_API_SHARED_SECRET`，不再回退到生产服务的密钥。身份可通过 `EVAL_USER_ID`、`EVAL_TENANT_ID`、`EVAL_ROLES` 配置。
+
+Seed 同步会更新已修改的 seed example，保留人工 metadata；不会删除额外例题，也不会覆盖非 seed 来源的例题。不要同时执行多个导入任务。

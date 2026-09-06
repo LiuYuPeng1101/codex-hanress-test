@@ -5,11 +5,12 @@ import os
 
 from langsmith import Client
 
-from langsmith_evaluators import default_evaluators
-from langsmith_target import LangSmithAgentTarget
+from evals.gate import summarize_results
+from evals.langsmith_evaluators import default_evaluators
+from evals.langsmith_target import LangSmithAgentTarget
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description="运行 LangSmith 单 Agent Experiment")
     parser.add_argument(
         "--dataset",
@@ -25,6 +26,8 @@ def main() -> None:
         default=int(os.getenv("LANGSMITH_EVAL_MAX_CONCURRENCY", "2")),
     )
     args = parser.parse_args()
+    if args.max_concurrency < 1:
+        parser.error("--max-concurrency must be positive")
 
     # Agent 本身依旧是 Codex Harness。LangSmith 只拿到一个普通 target function。
     target = LangSmithAgentTarget.from_env()
@@ -41,8 +44,11 @@ def main() -> None:
             "eval_type": "black-box-agent",
         },
     )
-    print(results)
+    summary = summarize_results(results)
+    print(f"total={summary.total} failed={summary.failed} skipped={summary.skipped}")
+    # No raw answers, credentials, or tool payloads in CI output.
+    return 0 if summary.passed else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

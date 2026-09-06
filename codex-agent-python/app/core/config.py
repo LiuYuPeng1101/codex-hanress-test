@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     app_env: str = "production"
     api_prefix: str = "/api/v1"
 
+    max_active_operations: int = Field(default=8, ge=1, le=1024)
+    operation_timeout_seconds: float = Field(default=180.0, gt=0, le=3600)
+    shutdown_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+
     agent_id: str = "order-agent"
     agent_workspace: Path = Path(".")
     codex_home: Path = Field(description="Codex Thread 持久化目录")

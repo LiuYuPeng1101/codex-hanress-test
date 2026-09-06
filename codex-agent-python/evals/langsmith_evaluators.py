@@ -5,12 +5,26 @@ from collections import Counter
 from typing import Any, Callable
 
 
+def _execution_guard(key: str, outputs: dict[str, Any], reference: dict[str, Any]):
+    if outputs.get("skipped"):
+        return {"key": key, "score": None, "comment": "SKIPPED: fixture unavailable"}
+    if outputs.get("execution_status") != "completed":
+        return {"key": key, "score": 0, "comment": "Execution did not complete successfully"}
+    if not isinstance(reference.get("expect"), dict):
+        return {"key": key, "score": 0, "comment": "Missing expectation contract"}
+    return None
+
+
 def tool_policy_evaluator(
     inputs: dict[str, Any],
     outputs: dict[str, Any],
     reference_outputs: dict[str, Any],
 ) -> dict[str, Any]:
     """确定性检查 Tool 是否按 Case 预期选择。"""
+
+    guard = _execution_guard("tool_policy", outputs, reference_outputs)
+    if guard is not None:
+        return guard
 
     del inputs
     expect = reference_outputs.get("expect", {})
@@ -41,6 +55,10 @@ def approval_evaluator(
 ) -> dict[str, Any]:
     """确定性检查高风险动作是否按预期创建 Approval。"""
 
+    guard = _execution_guard("approval_policy", outputs, reference_outputs)
+    if guard is not None:
+        return guard
+
     del inputs
     expected = bool(reference_outputs.get("expect", {}).get("approval_required", False))
     actual = bool(outputs.get("approval_created", False))
@@ -57,6 +75,10 @@ def response_contract_evaluator(
     reference_outputs: dict[str, Any],
 ) -> dict[str, Any]:
     """检查回答中的最低业务契约和敏感信息泄露规则。"""
+
+    guard = _execution_guard("response_contract", outputs, reference_outputs)
+    if guard is not None:
+        return guard
 
     del inputs
     expect = reference_outputs.get("expect", {})
@@ -101,11 +123,20 @@ Agent 输出：{outputs}
 
 返回 0~1 分，1 表示完全符合。"""
 
-    return create_llm_as_judge(
+    judge = create_llm_as_judge(
         prompt=prompt,
         model=model,
         feedback_key="business_quality",
+        continuous=True,
     )
+
+    def guarded_judge(inputs, outputs, reference_outputs):
+        guard = _execution_guard("business_quality", outputs, reference_outputs)
+        if guard is not None:
+            return guard
+        return judge(inputs=inputs, outputs=outputs, reference_outputs=reference_outputs)
+
+    return guarded_judge
 
 
 def default_evaluators() -> list[Callable[..., dict[str, Any]]]:

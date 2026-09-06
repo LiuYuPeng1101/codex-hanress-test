@@ -1,5 +1,8 @@
 # Codex Single Agent Project
 
+最新实现与验收边界：[可靠性与复用说明](codex-agent-python/docs/RELIABILITY.md)。当前支持单进程、单 Runtime；真实业务幂等和生产恢复仍需端到端验收。
+
+
 这个仓库只做 **一个基于 Codex Harness 的生产级业务 Agent**。当前示例是订单 / 售后 Agent。
 
 > 当前状态：**已经形成生产级架构基线，但尚未完成全部生产就绪验证。**

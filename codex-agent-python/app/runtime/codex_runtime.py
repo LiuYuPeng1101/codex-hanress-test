@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
@@ -17,6 +18,7 @@ from app.agents.definition import AgentDefinition, SandboxPolicy
 from app.events.codex_event_mapper import CodexEventMapper
 from app.events.models import AgentEvent
 from app.observability.tracing import get_tracer
+from app.runtime.admission import ExecutionFailed
 
 
 class CodexRuntime:
@@ -62,7 +64,11 @@ class CodexRuntime:
 
     async def start(self) -> None:
         if not self._started:
-            await self._codex.__aenter__()
+            try:
+                await self._codex.__aenter__()
+            except BaseException:
+                await self._codex.__aexit__(None, None, None)
+                raise
             self._started = True
 
     async def close(self) -> None:
@@ -123,7 +129,24 @@ class CodexRuntime:
             tenant_id=tenant_id,
             roles=roles,
         )
+        before = await thread.read(include_turns=True)
+        previous_ids = {turn.id for turn in before.thread.turns}
         await thread.compact()
+        # RPC acknowledgement is not completion. Keep admission until a new
+        # compaction Turn is terminal; the controller bounds this polling operation.
+        while True:
+            snapshot = await thread.read(include_turns=True)
+            for turn in snapshot.thread.turns:
+                if turn.id in previous_ids:
+                    continue
+                status = turn.status.value
+                if status in {"failed", "interrupted"}:
+                    raise ExecutionFailed("COMPACTION_FAILED")
+                if status == "completed" and any(
+                    item.model_dump().get("type") == "contextCompaction" for item in turn.items
+                ):
+                    return
+            await asyncio.sleep(0.25)
 
     async def run_turn(
         self,
@@ -146,6 +169,9 @@ class CodexRuntime:
             result = await thread.run(message, sandbox=self._sandbox())
             span.set_attribute("agent.runtime.turn.id", result.id)
             span.set_attribute("agent.turn.status", str(result.status))
+            status = getattr(result.status, "value", result.status)
+            if status != "completed":
+                raise ExecutionFailed("TURN_FAILED")
             return result.final_response or ""
 
     async def stream_turn(
@@ -169,12 +195,17 @@ class CodexRuntime:
         with self._tracer.start_as_current_span("agent.turn.stream") as span:
             self._set_common_span_attributes(span, conversation_id, thread_id, user_id, tenant_id)
             span.set_attribute("agent.runtime.turn.id", turn.id)
+            completed = False
             async for notification in turn.stream():
                 event = self._event_mapper.map(notification, conversation_id)
                 if event is None:
                     continue
                 span.add_event(event.type)
+                if event.type == "turn.completed":
+                    completed = True
                 yield event
+            if not completed:
+                raise RuntimeError("INCOMPLETE_RUNTIME_STREAM")
 
     async def _resume_thread(
         self,

@@ -3,22 +3,62 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import Any
 
 import httpx
 
 
+class EvaluationExecutionError(RuntimeError):
+    """A safe error code, never a provider payload or credential-bearing HTTP error."""
+
+
 @dataclass(slots=True)
 class AgentObservation:
-    """一次黑盒 Agent 执行后交给 LangSmith 的可评分结果。"""
-
     conversation_id: str
     response_text: str = ""
     tool_calls: list[str] = field(default_factory=list)
     approval_created: bool = False
     events: list[str] = field(default_factory=list)
+    completed: bool = False
+
+    def consume(self, event_name: str, payload_text: str) -> None:
+        if event_name == "error":
+            raise EvaluationExecutionError("AGENT_STREAM_ERROR")
+        if not payload_text:
+            raise EvaluationExecutionError("EMPTY_EVENT")
+        try:
+            payload = json.loads(payload_text)
+        except ValueError:
+            raise EvaluationExecutionError("INVALID_EVENT_JSON") from None
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+            raise EvaluationExecutionError("INVALID_EVENT_SCHEMA")
+        if payload.get("conversation_id") != self.conversation_id:
+            raise EvaluationExecutionError("CONVERSATION_MISMATCH")
+        if payload.get("type") != event_name:
+            raise EvaluationExecutionError("EVENT_TYPE_MISMATCH")
+        if self.completed:
+            raise EvaluationExecutionError("EVENT_AFTER_COMPLETION")
+        self.events.append(event_name)
+        data = payload["data"]
+        if event_name == "message.delta":
+            delta = data.get("delta")
+            if not isinstance(delta, str):
+                raise EvaluationExecutionError("INVALID_MESSAGE_DELTA")
+            self.response_text += delta
+        elif event_name == "tool.started":
+            name = data.get("tool_name")
+            if not isinstance(name, str) or not name:
+                raise EvaluationExecutionError("INVALID_TOOL_NAME")
+            self.tool_calls.append(name)
+        elif event_name == "turn.completed":
+            if data.get("status") != "completed" or data.get("error"):
+                raise EvaluationExecutionError("TURN_NOT_SUCCESSFUL")
+            self.completed = True
 
     def to_output(self) -> dict[str, Any]:
+        if not self.completed:
+            raise EvaluationExecutionError("INCOMPLETE_STREAM")
         return {
             "conversation_id": self.conversation_id,
             "answer": self.response_text,
@@ -26,14 +66,15 @@ class AgentObservation:
             "approval_created": self.approval_created,
             "events": self.events,
             "skipped": False,
+            "execution_status": "completed",
         }
 
 
 class LangSmithAgentTarget:
-    """通过当前 Agent Service 的公开 HTTP/SSE API 运行真实 Agent。
+    """Black-box target reusable with any Agent implementing the public event contract.
 
-    LangSmith 只负责 Dataset、Experiment 和评分；Agent 本身仍然是 Codex Harness，
-    不需要为了评测改成 LangChain Agent。
+    Each example owns its conversation. Transport injection is for contract tests;
+    production experiments always call the configured HTTP/SSE service.
     """
 
     def __init__(
@@ -42,56 +83,76 @@ class LangSmithAgentTarget:
         base_url: str,
         api_secret: str,
         timeout_seconds: float = 180.0,
+        user_id: str = "langsmith-eval-user",
+        tenant_id: str = "langsmith-eval-tenant",
+        roles: str = "support.agent,agent.approver",
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
         self._base_url = base_url.rstrip("/")
-        self._timeout = httpx.Timeout(timeout_seconds, connect=10.0)
+        self._timeout_seconds = timeout_seconds
+        self._timeout = httpx.Timeout(timeout_seconds, connect=min(10.0, timeout_seconds))
+        self._transport = transport
         self._headers = {
             "Authorization": f"Bearer {api_secret}",
-            "X-User-Id": "langsmith-eval-user",
-            "X-Tenant-Id": "langsmith-eval-tenant",
-            "X-Roles": "support.agent,agent.approver,agent.operator",
+            "X-User-Id": user_id,
+            "X-Tenant-Id": tenant_id,
+            "X-Roles": roles,
         }
 
     @classmethod
-    def from_env(cls) -> "LangSmithAgentTarget":
-        api_secret = os.getenv("EVAL_API_SHARED_SECRET") or os.getenv("API_SHARED_SECRET")
+    def from_env(cls) -> LangSmithAgentTarget:
+        # Never silently fall back to a production service secret.
+        api_secret = os.environ.get("EVAL_API_SHARED_SECRET")
         if not api_secret:
-            raise RuntimeError("缺少 EVAL_API_SHARED_SECRET 或 API_SHARED_SECRET")
+            raise RuntimeError("缺少专用测试环境的 EVAL_API_SHARED_SECRET")
         return cls(
             base_url=os.getenv("EVAL_BASE_URL", "http://127.0.0.1:8000"),
             api_secret=api_secret,
             timeout_seconds=float(os.getenv("EVAL_TIMEOUT_SECONDS", "180")),
+            user_id=os.getenv("EVAL_USER_ID", "langsmith-eval-user"),
+            tenant_id=os.getenv("EVAL_TENANT_ID", "langsmith-eval-tenant"),
+            roles=os.getenv("EVAL_ROLES", "support.agent,agent.approver"),
         )
 
     def __call__(self, inputs: dict[str, Any]) -> dict[str, Any]:
-        fixture = inputs.get("requires_fixture")
-        if fixture:
+        if inputs.get("requires_fixture"):
             return {
-                "answer": "",
-                "tool_calls": [],
-                "approval_created": False,
-                "events": [],
                 "skipped": True,
-                "skip_reason": f"需要外部 fixture: {fixture}",
+                "execution_status": "skipped",
+                "skip_reason": "REQUIRED_FIXTURE_UNAVAILABLE",
             }
-
-        message = str(inputs.get("message") or "").strip()
-        if not message:
-            raise ValueError("LangSmith Dataset example 缺少 message")
-
-        with httpx.Client(timeout=self._timeout) as client:
-            conversation_id = self._create_conversation(client)
-            observation = self._stream_turn(client, conversation_id, message)
-            observation.approval_created = self._has_approval(client, conversation_id)
-            return observation.to_output()
-
-    def _create_conversation(self, client: httpx.Client) -> str:
-        response = client.post(
-            f"{self._base_url}/api/v1/agent/conversations",
-            headers=self._headers,
-        )
-        response.raise_for_status()
-        return str(response.json()["conversation_id"])
+        message = inputs.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("Dataset example requires a nonempty message")
+        try:
+            with httpx.Client(timeout=self._timeout, transport=self._transport) as client:
+                response = client.post(
+                    f"{self._base_url}/api/v1/agent/conversations",
+                    headers=self._headers,
+                )
+                response.raise_for_status()
+                conversation_id = response.json()["conversation_id"]
+                if not isinstance(conversation_id, str) or not conversation_id:
+                    raise EvaluationExecutionError("INVALID_CONVERSATION_ID")
+                observation = self._stream_turn(client, conversation_id, message)
+                response = client.get(
+                    f"{self._base_url}/api/v1/approvals",
+                    headers=self._headers,
+                )
+                response.raise_for_status()
+                items = response.json()["items"]
+                if not isinstance(items, list) or any(not isinstance(i, dict) for i in items):
+                    raise EvaluationExecutionError("INVALID_APPROVAL_RESPONSE")
+                observation.approval_created = any(
+                    item.get("conversation_id") == conversation_id for item in items
+                )
+                return observation.to_output()
+        except httpx.HTTPError:
+            raise EvaluationExecutionError("AGENT_HTTP_ERROR") from None
+        except (KeyError, ValueError, TypeError):
+            raise EvaluationExecutionError("INVALID_AGENT_RESPONSE") from None
 
     def _stream_turn(
         self,
@@ -99,60 +160,54 @@ class LangSmithAgentTarget:
         conversation_id: str,
         message: str,
     ) -> AgentObservation:
-        observation = AgentObservation(conversation_id=conversation_id)
-        url = f"{self._base_url}/api/v1/agent/conversations/{conversation_id}/turns/stream"
+        observation = AgentObservation(conversation_id)
+        deadline = monotonic() + self._timeout_seconds
         with client.stream(
             "POST",
-            url,
-            headers={**self._headers, "Content-Type": "application/json"},
+            f"{self._base_url}/api/v1/agent/conversations/{conversation_id}/turns/stream",
+            headers=self._headers,
             json={"message": message},
         ) as response:
             response.raise_for_status()
-            event_name: str | None = None
+            if response.headers.get("content-type", "").split(";")[0] != "text/event-stream":
+                raise EvaluationExecutionError("EXPECTED_EVENT_STREAM")
+            event_name = "message"
             data_lines: list[str] = []
-
-            for line in response.iter_lines():
+            # Bound accumulated output, including silent or malicious streaming responses.
+            for line in _bounded_lines(response, deadline):
                 if not line:
-                    if event_name is not None:
-                        self._consume_sse_event(observation, event_name, "\n".join(data_lines))
-                    event_name = None
-                    data_lines.clear()
-                    continue
-                if line.startswith("event:"):
-                    event_name = line.removeprefix("event:").strip()
+                    if data_lines:
+                        observation.consume(event_name, "\n".join(data_lines))
+                        if observation.completed:
+                            break
+                    event_name, data_lines = "message", []
+                elif line.startswith("event:"):
+                    event_name = line[6:].strip()
                 elif line.startswith("data:"):
-                    data_lines.append(line.removeprefix("data:").strip())
-
-            if event_name is not None:
-                self._consume_sse_event(observation, event_name, "\n".join(data_lines))
+                    data_lines.append(line[5:].removeprefix(" "))
+            # An unterminated record at EOF is not a valid completed SSE event.
+        if not observation.completed:
+            raise EvaluationExecutionError("INCOMPLETE_STREAM")
         return observation
 
-    @staticmethod
-    def _consume_sse_event(
-        observation: AgentObservation,
-        event_name: str,
-        payload_text: str,
-    ) -> None:
-        observation.events.append(event_name)
-        if not payload_text:
-            return
 
-        payload = json.loads(payload_text)
-        data = payload.get("data", {})
-        if event_name == "message.delta":
-            observation.response_text += str(data.get("delta", ""))
-        elif event_name == "tool.started":
-            tool_name = data.get("tool_name")
-            if isinstance(tool_name, str) and tool_name:
-                observation.tool_calls.append(tool_name)
-
-    def _has_approval(self, client: httpx.Client, conversation_id: str) -> bool:
-        response = client.get(
-            f"{self._base_url}/api/v1/approvals",
-            headers=self._headers,
-        )
-        response.raise_for_status()
-        return any(
-            item.get("conversation_id") == conversation_id
-            for item in response.json().get("items", [])
-        )
+def _bounded_lines(response: httpx.Response, deadline: float):
+    # Bound bytes before line decoding so an endless unterminated data line cannot
+    # grow httpx.iter_lines()'s internal buffer without limit.
+    pending = bytearray()
+    total = 0
+    for chunk in response.iter_bytes():
+        total += len(chunk)
+        if total > 2_000_000:
+            raise EvaluationExecutionError("STREAM_TOO_LARGE")
+        if monotonic() > deadline:
+            raise EvaluationExecutionError("STREAM_DEADLINE_EXCEEDED")
+        pending.extend(chunk)
+        while (end := pending.find(b"\n")) >= 0:
+            line = bytes(pending[:end]).removesuffix(b"\r")
+            del pending[: end + 1]
+            try:
+                yield line.decode("utf-8")
+            except UnicodeDecodeError:
+                raise EvaluationExecutionError("INVALID_EVENT_ENCODING") from None
+    # SSE dispatch requires a blank line; do not synthesize it at EOF.

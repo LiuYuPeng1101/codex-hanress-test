@@ -1,5 +1,8 @@
 # Codex Single Agent Service
 
+最新实现与验收边界：[可靠性与复用说明](docs/RELIABILITY.md)。当前支持单进程、单 Runtime；真实业务幂等和生产恢复仍需端到端验收。
+
+
 这个项目现在只做一件事：**基于 Codex Harness 开发并运行一个生产级业务 Agent**。
 
 当前 Agent 是订单 / 售后方向。我们不再开发 Agent Platform、Agent Control Plane、Registry、Runtime Scheduler 或多 Agent Gateway。

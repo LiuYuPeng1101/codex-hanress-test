@@ -32,7 +32,7 @@ jobs:
           cache-dependency-path: codex-agent-python/pyproject.toml
       - name: Install Python dependencies
         working-directory: codex-agent-python
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,eval]"
       - name: Apply database migrations
         env:
           PGPASSWORD: agent

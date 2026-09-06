@@ -33,7 +33,10 @@ eval = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["app*"]
+include = ["app*", "evals*"]
+
+[tool.setuptools.package-data]
+evals = ["cases.jsonl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
