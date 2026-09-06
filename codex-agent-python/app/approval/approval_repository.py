@@ -12,12 +12,12 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
-    create_engine,
     func,
     insert,
     or_,
     select,
     text,
+    tuple_,
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -25,6 +25,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
+from app.core.database import DatabasePolicy, database_engine
 from app.executions.service import ExecutionDecision
 
 
@@ -89,8 +90,8 @@ class ApprovalRepository:
     当前 Runtime callback 不再创建或消费它们。
     """
 
-    def __init__(self, database_url: str) -> None:
-        self._engine: Engine = create_engine(database_url, pool_pre_ping=True)
+    def __init__(self, database_url: str, policy: DatabasePolicy | None = None) -> None:
+        self._engine: Engine = database_engine(database_url, policy)
 
     def healthcheck(self) -> None:
         with self._engine.connect() as conn:
@@ -273,16 +274,55 @@ class ApprovalRepository:
             row = conn.execute(stmt).mappings().one_or_none()
         return self._from_row(row) if row is not None else None
 
-    def list_for_tenant(self, tenant_id: str, limit: int = 100) -> list[ApprovalRequest]:
-        stmt = (
-            select(approval_requests)
-            .where(approval_requests.c.tenant_id == tenant_id)
-            .order_by(approval_requests.c.created_at.desc())
-            .limit(limit)
-        )
+    def list_for_tenant(
+        self,
+        tenant_id: str,
+        limit: int = 100,
+        *,
+        status: str | None = None,
+        conversation_id: str | None = None,
+        before: tuple[datetime, str] | None = None,
+    ) -> list[ApprovalRequest]:
+        if not 1 <= limit <= 201:
+            raise ValueError("Invalid page size")
+        stmt = select(approval_requests).where(approval_requests.c.tenant_id == tenant_id)
+        if status is not None:
+            stmt = stmt.where(approval_requests.c.status == status)
+            if status == "PENDING":
+                stmt = stmt.where(
+                    or_(
+                        approval_requests.c.expires_at.is_(None),
+                        approval_requests.c.expires_at > func.clock_timestamp(),
+                    )
+                )
+        if conversation_id is not None:
+            stmt = stmt.where(approval_requests.c.conversation_id == conversation_id)
+        if before is not None:
+            stmt = stmt.where(
+                tuple_(approval_requests.c.created_at, approval_requests.c.id) < before
+            )
+        stmt = stmt.order_by(
+            approval_requests.c.created_at.desc(), approval_requests.c.id.desc()
+        ).limit(limit)
         with self._engine.connect() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [self._from_row(row) for row in rows]
+
+    def get_for_tenant(self, approval_id: str, tenant_id: str) -> ApprovalRequest:
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(
+                    select(approval_requests).where(
+                        approval_requests.c.id == approval_id,
+                        approval_requests.c.tenant_id == tenant_id,
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None:
+            raise KeyError(approval_id)
+        return self._from_row(row)
 
     def get(self, approval_id: str) -> ApprovalRequest:
         stmt = select(approval_requests).where(approval_requests.c.id == approval_id)

@@ -77,7 +77,7 @@ Adapter 不自动重试 POST、不跟随重定向；当前 HTTP 连接期限为 
 4. Java 设置同一内部密钥与 `EXECUTION_SERVICE_BASE_URL`。可配置 `EXECUTION_SERVICE_PREPARE_PATH`，默认 `/api/v1/internal/executions/prepare`；修改 Python `API_PREFIX` 时必须同步。
 5. 部署新 Python 与 Java，再恢复业务流量。回滚工具策略前必须停止写流量并对账，不能在线换回绕过门禁的旧 Adapter。
 
-服务凭据与控制面配置必须对模型的命令执行环境、工作目录和用户文件不可见，并通过网络边界限制 OMS 只接受业务 Adapter。当前源码的宿主环境继承和实际沙箱隔离仍须在部署验收中审查；本次服务认证不能替代该边界，也不防御已被攻陷的 Adapter。
+服务凭据与控制面配置必须对模型的命令执行环境、工作目录和用户文件不可见，并通过网络边界限制 OMS 只接受业务 Adapter。当前通过 launcher 清理宿主环境并限制订单 Agent 的本地工具；仍须在部署验收中验证实际文件/网络边界，本次服务认证也不防御已被攻陷的 Adapter。
 
 ## 验证范围
 

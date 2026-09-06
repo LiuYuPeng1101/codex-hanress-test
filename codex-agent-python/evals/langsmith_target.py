@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from evals.fixtures import FixtureVerifier, HttpFixtureVerifier
+
 
 class EvaluationExecutionError(RuntimeError):
     """A safe error code, never a provider payload or credential-bearing HTTP error."""
@@ -87,10 +89,13 @@ class LangSmithAgentTarget:
         tenant_id: str = "langsmith-eval-tenant",
         roles: str = "support.agent,agent.approver",
         transport: httpx.BaseTransport | None = None,
+        fixture_verifier: FixtureVerifier | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         self._base_url = base_url.rstrip("/")
+        self._fixture_verifier = fixture_verifier
+        self._tenant_id = tenant_id
         self._timeout_seconds = timeout_seconds
         self._timeout = httpx.Timeout(timeout_seconds, connect=min(10.0, timeout_seconds))
         self._transport = transport
@@ -107,7 +112,12 @@ class LangSmithAgentTarget:
         api_secret = os.environ.get("EVAL_API_SHARED_SECRET")
         if not api_secret:
             raise RuntimeError("缺少专用测试环境的 EVAL_API_SHARED_SECRET")
+        fixture_url = os.getenv("EVAL_FIXTURE_BASE_URL")
+        verifier = None
+        if fixture_url:
+            verifier = HttpFixtureVerifier(fixture_url, os.environ.get("EVAL_FIXTURE_SECRET", ""))
         return cls(
+            fixture_verifier=verifier,
             base_url=os.getenv("EVAL_BASE_URL", "http://127.0.0.1:8000"),
             api_secret=api_secret,
             timeout_seconds=float(os.getenv("EVAL_TIMEOUT_SECONDS", "180")),
@@ -117,7 +127,14 @@ class LangSmithAgentTarget:
         )
 
     def __call__(self, inputs: dict[str, Any]) -> dict[str, Any]:
-        if inputs.get("requires_fixture"):
+        fixture = inputs.get("requires_fixture")
+        if fixture and (
+            not isinstance(fixture, str)
+            or self._fixture_verifier is None
+            or not self._fixture_verifier.ready(
+                fixture, agent_url=self._base_url, tenant_id=self._tenant_id
+            )
+        ):
             return {
                 "skipped": True,
                 "execution_status": "skipped",
@@ -140,6 +157,7 @@ class LangSmithAgentTarget:
                 response = client.get(
                     f"{self._base_url}/api/v1/approvals",
                     headers=self._headers,
+                    params={"conversation_id": conversation_id, "limit": 1},
                 )
                 response.raise_for_status()
                 items = response.json()["items"]

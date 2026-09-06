@@ -1,5 +1,20 @@
 # Codex Single Agent Service
 
+## 新增：运行安全与联调准备（2026-09-06）
+
+| 能力 | 当前行为 |
+|---|---|
+| Runtime 启动环境 | 经独立 launcher 的实际 exec 边界清理环境；业务 API、执行授权和数据库凭据不传给 Codex |
+| 订单 Agent 本地权限 | 固定 READ_ONLY，禁用 shell/unified_exec、JS、浏览器、插件和子 Agent 等旁路；现有订单 Skill 由宿主加载为开发指令 |
+| 数据库故障 | 明确连接、连接池、SQL、锁等待期限；数据库异常返回安全 503 |
+| 就绪检查 | 一个后台探测任务检查数据库，`/ready` 读取探测结果；失败或结果过期返回 503，恢复后重新就绪 |
+| 审批查询 | 游标分页、状态/会话筛选、租户隔离的单条查询；PENDING 筛选排除过期的新授权 |
+| fixture 评测 | 验证独立测试服务的 fixture、租户、目标环境后执行；缺失/异常依然跳过并阻止发布门禁 |
+| MCP 联调测试 | 经真正的 Streamable HTTP 初始化、通知和 tools/call，验证身份、审批门禁及固定执行 ID |
+
+运行模式仍是一个进程、一个 Runtime、一个专属 CODEX_HOME。环境清理与工具限制不等于可供任意代码使用的 OS 隔离沙箱；需要本地代码执行的 Agent 必须另行隔离部署。真实模型效果与真实 OMS 事务幂等仍需验收。
+
+
 审批及幂等链路见 [执行契约](docs/EXECUTION_CONTRACT.md)。
 
 最新实现与验收边界：[可靠性与复用说明](docs/RELIABILITY.md)。当前支持单进程、单 Runtime；真实业务幂等和生产恢复仍需端到端验收。
@@ -708,3 +723,53 @@ A2A Platform
 ```
 
 只有当真实业务中出现第二、第三、更多 Agent，并且产生明确重复问题时，再从实际重复代码抽平台能力。
+
+## 运行安全与联调配置
+
+### Runtime
+
+SDK 0.147 会再次合并宿主环境，因此 `config.env` 白名单本身不足以隔离凭据。当前由 `python -I <绝对路径>/launcher.py` 启动，launcher 清理环境后使用 `execve` 启动锁定版本 CLI。仅保留基础运行路径/语言、CODEX_HOME、OPENAI_API_KEY 和证书路径。自定义模型凭据变量不会自动透传。
+
+订单业务通过已认证的 MCP 工具执行。`shell_tool` / `unified_exec`、JS/Code Mode、浏览器、插件、Hooks、子 Agent 等入口被明确关闭，启动和 resume 都应用策略。某些模型仍可暴露 apply_patch；READ_ONLY 沙箱和拒绝提权的 callback 阻止写入，不能把“隐藏工具”当作唯一权限边界。当前 Runtime 拒绝 WORKSPACE_WRITE/FULL_ACCESS 定义。
+
+订单规则仍维护在 `.agents/skills/order-analysis/SKILL.md`，由宿主在启动时读取并作为 Thread 开发指令注入，不需要模型执行 `cat`。Docker 将只读内容放在 `/agent`，应用代码由 root 持有，运行账户仅拥有 `/var/lib/codex`。该目录须专属持久卷，不能放用户上传文件或来自未知来源的配置。控制面的 MCP 凭据仍由可信 Runtime 管理，不会作为 Tool 参数提供给模型。
+
+这一模式不提供任意代码执行的操作系统级隔离。后续若业务确需 Shell，必须把 Runtime 与业务服务分开进程身份/文件与网络权限，并单独做凭据读取、越权和逃逸验收，不能直接打开特性开关。
+
+### PostgreSQL 与 readiness
+
+| 环境变量 | 默认值 |
+|---|---|
+| `DATABASE_CONNECT_SECONDS` | 3 秒 |
+| `DATABASE_POOL_SECONDS` | 2 秒 |
+| `DATABASE_STATEMENT_MS` | 5000 毫秒 |
+| `DATABASE_LOCK_MS` | 1000 毫秒 |
+
+每个仓储连接池固定最多 5 个连接、不额外扩容；statement/lock timeout 在连接建立时由 PostgreSQL 设置。连接同时启用 TCP 保活与 user timeout。锁等待期限不得大于 SQL 期限。超时属于失败，不得据此认定订单回滚。
+
+每轮后台探测完成后等待 5 秒再探测；失败立即标记不可用，最后成功结果超过 60 秒也失效。`/api/v1/ready` 不执行 SQL，不因探针流量累积数据库任务。服务启动时数据库不可用直接失败；运行期恢复后可重新就绪，但 Runtime 因结果不明而关闭的准入仍需按原对账流程恢复。
+
+### 审批 API
+
+```http
+GET /api/v1/approvals?status=PENDING&limit=50
+GET /api/v1/approvals?conversation_id=<uuid>&limit=50
+GET /api/v1/approvals?cursor=<next_cursor>&limit=50
+GET /api/v1/approvals/<approval_uuid>
+```
+
+列表响应增加 `next_cursor`，为 null 表示已到最后一页。游标分页按创建时间及 ID 稳定倒序；后续页须继续携带原筛选条件。limit 为 1–200。状态支持 PENDING / APPROVED / REJECTED / CONSUMED；PENDING 不包含已过期的新授权。所有请求仍需服务认证和 `agent.approver` 角色，跨租户单条查询返回 404。分页不是跨页的事务快照，审批状态并发变更后应刷新列表。
+
+### fixture 与完整联调
+
+fixture 配置及测试服务启动方法见 [Eval README](evals/README.md#测试-fixture-接入)。先运行单元、PostgreSQL 与 MCP 协议测试，再在隔离部署中配置真实模型，验证查询、申请审批、拒绝、批准后重试，以及恶意工具结果。真实 OMS 的写入与事件去重必须依照 [执行契约](docs/EXECUTION_CONTRACT.md) 验收。
+
+验证命令：
+
+```bash
+pip install -e '.[dev,eval]'
+ruff check app tests evals
+pytest
+```
+
+设置 `TEST_DATABASE_URL` 并应用全部 migrations 后，PostgreSQL 集成测试才会执行。本地未配置时显示 skipped；CI 配有 PostgreSQL 16。Java 目录运行 `mvn -B test`，包含不依赖模型账户的真实 MCP HTTP 协议测试。协议测试的授权服务与 OMS 是测试替身，不能代表真实模型推理或真实订单事务已验收。

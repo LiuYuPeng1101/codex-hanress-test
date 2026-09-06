@@ -146,3 +146,13 @@ MCP Endpoint：
 生产部署还应在网络层叠加 mTLS / Service Mesh / NetworkPolicy，并由 Secret Manager 管理和轮换服务凭据。
 
 写操作执行授权、升级次序及 OMS 原子去重要求见 [执行契约](../codex-agent-python/docs/EXECUTION_CONTRACT.md)。当前 Adapter 只有取得有效授权后才调用 OMS，并携带 `Idempotency-Key`；重试沿用同一 ID。
+
+## 新增：真实 MCP 传输验证
+
+`McpTransportTests` 启动完整 Spring Boot 服务，通过 HTTP 执行 initialize、notifications/initialized 和 tools/call，检查读取身份、未批准禁止写入、批准后携带固定 execution ID 和跨会话身份传递。授权服务和 OMS 使用测试 HTTP 服务，测试不消耗模型 API，不替代真实 OMS 原子去重验收。
+
+```bash
+mvn -B test
+```
+
+OMS 的 HTTP 错误统一转换为 `ORDER_SERVICE_UNAVAILABLE`，不向工具调用方传递原始错误正文/内部 URL；空成功响应也视为失败。授权服务继续使用独立错误边界。

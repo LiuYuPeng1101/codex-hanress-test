@@ -1,5 +1,22 @@
 # Codex Single Agent Project
 
+## 新增：运行安全与联调准备（2026-09-06）
+
+| 能力 | 当前行为 |
+|---|---|
+| Runtime 启动环境 | 经独立 launcher 的实际 exec 边界清理环境；业务 API、执行授权和数据库凭据不传给 Codex |
+| 订单 Agent 本地权限 | 固定 READ_ONLY，禁用 shell/unified_exec、JS、浏览器、插件和子 Agent 等旁路；现有订单 Skill 由宿主加载为开发指令 |
+| 数据库故障 | 明确连接、连接池、SQL、锁等待期限；数据库异常返回安全 503 |
+| 就绪检查 | 一个后台探测任务检查数据库，`/ready` 读取探测结果；失败或结果过期返回 503，恢复后重新就绪 |
+| 审批查询 | 游标分页、状态/会话筛选、租户隔离的单条查询；PENDING 筛选排除过期的新授权 |
+| fixture 评测 | 验证独立测试服务的 fixture、租户、目标环境后执行；缺失/异常依然跳过并阻止发布门禁 |
+| MCP 联调测试 | 经真正的 Streamable HTTP 初始化、通知和 tools/call，验证身份、审批门禁及固定执行 ID |
+
+运行模式仍是一个进程、一个 Runtime、一个专属 CODEX_HOME。环境清理与工具限制不等于可供任意代码使用的 OS 隔离沙箱；需要本地代码执行的 Agent 必须另行隔离部署。真实模型效果与真实 OMS 事务幂等仍需验收。
+
+详细配置与验收步骤见 [Python README](codex-agent-python/README.md#运行安全与联调配置)。
+
+
 最新实现与验收边界：[可靠性与复用说明](codex-agent-python/docs/RELIABILITY.md)。当前支持单进程、单 Runtime；真实业务幂等和生产恢复仍需端到端验收。
 
 

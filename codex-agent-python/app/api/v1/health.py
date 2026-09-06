@@ -20,6 +20,12 @@ async def health() -> HealthResponse:
 @router.get("/ready")
 async def ready(request: Request) -> dict[str, str]:
     service = getattr(request.app.state, "agent_service", None)
-    if service is None or not service.admission.accepting:
+    dependencies = getattr(request.app.state, "dependency_readiness", None)
+    if (
+        service is None
+        or not service.admission.accepting
+        or dependencies is None
+        or not dependencies.ready
+    ):
         raise HTTPException(status_code=503, detail="SERVICE_UNAVAILABLE")
     return {"status": "ready"}

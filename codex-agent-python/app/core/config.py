@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     app_env: str = "production"
     api_prefix: str = "/api/v1"
 
+    database_connect_seconds: int = Field(default=3, ge=1, le=10)
+    database_pool_seconds: float = Field(default=2, gt=0, le=10)
+    database_statement_ms: int = Field(default=5000, ge=100, le=10000)
+    database_lock_ms: int = Field(default=1000, ge=100, le=10000)
+
     max_active_operations: int = Field(default=8, ge=1, le=1024)
     operation_timeout_seconds: float = Field(default=180.0, gt=0, le=3600)
     shutdown_timeout_seconds: float = Field(default=30.0, gt=0, le=300)

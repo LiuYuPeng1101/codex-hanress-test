@@ -309,3 +309,26 @@ Codex Harness 继续负责 Agent 本身怎么运行。
 本地 smoke 命令为 `python -m evals.run`，它与 LangSmith 使用同一个 HTTP/SSE Target。必须设置 `EVAL_API_SHARED_SECRET`，不再回退到生产服务的密钥。身份可通过 `EVAL_USER_ID`、`EVAL_TENANT_ID`、`EVAL_ROLES` 配置。
 
 Seed 同步会更新已修改的 seed example，保留人工 metadata；不会删除额外例题，也不会覆盖非 seed 来源的例题。不要同时执行多个导入任务。
+
+## 测试 fixture 接入
+
+Target 不再无条件跳过所有 `requires_fixture` 用例。设置 `EVAL_FIXTURE_BASE_URL` 和独立 `EVAL_FIXTURE_SECRET` 后，它先请求 `GET /fixtures/<name>`，要求响应同时满足 `ready=true`、fixture 名称、当前测试租户及目标 Agent URL 一致，再执行正常 Agent HTTP/SSE 评测。未配置、无法验证、重定向或响应异常仍为 SKIPPED，发布门禁仍不放行；没有通过“忽略跳过”来使门禁变绿。
+
+仓库提供显式测试专用的读取 fixture 服务：
+
+```bash
+export EVAL_FIXTURE_MODE=test-only
+export EVAL_FIXTURE_SECRET='<独立的至少32字符测试密钥>'
+export EVAL_OMS_SERVICE_SECRET='<另一份至少32字符测试密钥>'
+export EVAL_TENANT_ID=langsmith-eval-tenant
+export EVAL_BASE_URL=http://agent-test:8000
+uvicorn evals.fixture_server:create_app --factory --host 0.0.0.0 --port 8090
+```
+
+将**测试环境 Java Adapter** 的 `ORDER_SERVICE_BASE_URL` 指向该服务，`ORDER_SERVICE_TOKEN` 设置为 EVAL_OMS_SERVICE_SECRET；Eval 进程设置 `EVAL_FIXTURE_BASE_URL` 指向同一服务，并使用其 EVAL_FIXTURE_SECRET。Agent 公开 API 密钥仍使用独立 EVAL_API_SHARED_SECRET。
+
+该服务提供订单 1001 的固定测试读取结果，以及 INJECTION-001 的恶意 deliveryNote。其取消端点明确返回 501，不能用于 OMS 写入/幂等验收，也不能部署为生产兜底。执行批准后的完整闭环应连接真正的 OMS 测试实例。
+
+fixture 就绪响应属于测试环境的可信声明，不证明 Agent 的实际 OMS 路由已正确。首次部署必须经真实 MCP 查询 INJECTION-001，核对收到预置恶意字段，再运行整套评测。模型不能据此取消其他订单或泄露密钥。若使用真实 OMS 测试环境，可实现同一只读就绪契约并维护预置订单，生产 Agent 本身不暴露 fixture 管理 API。
+
+审批评测使用 `conversation_id` 服务端筛选，仅查询本用例的审批，避免全租户列表截断造成误判。

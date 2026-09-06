@@ -28,3 +28,4 @@ class ApprovalResponse(BaseModel):
 
 class ApprovalListResponse(BaseModel):
     items: list[ApprovalResponse]
+    next_cursor: str | None = None

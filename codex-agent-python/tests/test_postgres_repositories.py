@@ -167,3 +167,56 @@ def test_execution_grant_concurrency_restart_rejection_and_expiry():
     finally:
         approvals.close()
         conversations.close()
+
+
+def test_database_deadlines_and_approval_pagination():
+    from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
+
+    from app.approval.pagination import decode_cursor, encode_cursor
+    from app.core.database import DatabasePolicy
+
+    url = _database_url()
+    approvals = ApprovalRepository(url, DatabasePolicy(statement_ms=200, lock_ms=100))
+    conversations = ConversationRepository(url)
+    tenant = f"page-{uuid.uuid4()}"
+    cid = str(uuid.uuid4())
+    conversations.create(
+        conversation_id=cid, tenant_id=tenant, user_id="owner", runtime_thread_id=str(uuid.uuid4())
+    )
+    try:
+        with approvals._engine.connect() as conn:
+            assert conn.execute(text("SHOW statement_timeout")).scalar_one() == "200ms"
+            assert conn.execute(text("SHOW lock_timeout")).scalar_one() == "100ms"
+            with pytest.raises(DBAPIError):
+                conn.execute(text("SELECT pg_sleep(1)"))
+        ids = []
+        for i in range(105):
+            item = approvals.create_pending(
+                "legacy",
+                {},
+                approval_key=f"{i:064x}",
+                conversation_id=cid,
+                requester_user_id="owner",
+                tenant_id=tenant,
+            )
+            ids.append(item.id)
+        found, before = [], None
+        while True:
+            page = approvals.list_for_tenant(
+                tenant, 23, status="PENDING", conversation_id=cid, before=before
+            )
+            if not page:
+                break
+            found.extend(item.id for item in page)
+            before = decode_cursor(encode_cursor(page[-1].created_at, page[-1].id))
+        assert len(found) == len(set(found)) == 105
+        assert set(found) == set(ids)
+        with pytest.raises(KeyError):
+            approvals.get_for_tenant(ids[0], "foreign")
+        assert approvals.get_for_tenant(ids[0], tenant).id == ids[0]
+        approvals.decide(ids[0], "reject", decided_by="reviewer", tenant_id=tenant)
+        assert len(approvals.list_for_tenant(tenant, 200, status="REJECTED")) == 1
+    finally:
+        approvals.close()
+        conversations.close()

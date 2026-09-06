@@ -28,8 +28,21 @@ class ApprovalService:
             return {"decision": "decline"}
         return {}
 
-    def list_approvals(self, *, tenant_id: str):
-        return self._repository.list_for_tenant(tenant_id)
+    def list_approvals(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+        status: str | None = None,
+        conversation_id: str | None = None,
+        before=None,
+    ):
+        return self._repository.list_for_tenant(
+            tenant_id, limit, status=status, conversation_id=conversation_id, before=before
+        )
+
+    def get_approval(self, approval_id: str, *, tenant_id: str):
+        return self._repository.get_for_tenant(approval_id, tenant_id)
 
     def approve(self, approval_id: str, *, user_id: str, tenant_id: str):
         return self._repository.decide(

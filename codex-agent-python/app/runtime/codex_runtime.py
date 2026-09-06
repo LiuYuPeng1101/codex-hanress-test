@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Callable
@@ -19,6 +20,7 @@ from app.events.codex_event_mapper import CodexEventMapper
 from app.events.models import AgentEvent
 from app.observability.tracing import get_tracer
 from app.runtime.admission import ExecutionFailed
+from app.runtime.policy import business_runtime_config
 
 
 class CodexRuntime:
@@ -33,7 +35,13 @@ class CodexRuntime:
         definition: AgentDefinition,
         codex_home: Path,
         approval_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
+        developer_instructions: str | None = None,
     ) -> None:
+        if definition.sandbox != SandboxPolicy.READ_ONLY:
+            raise ValueError(
+                "Business Runtime requires READ_ONLY; local code needs a separate isolated runtime"
+            )
+        self._developer_instructions = developer_instructions
         self._definition = definition
         self._workspace = Path(definition.workspace).resolve()
         self._codex_home = codex_home.resolve()
@@ -44,12 +52,15 @@ class CodexRuntime:
         if not os.access(self._codex_home, os.W_OK):
             raise RuntimeError(f"Codex 持久化目录不可写: {self._codex_home}")
 
-        runtime_env = dict(os.environ)
-        runtime_env["CODEX_HOME"] = str(self._codex_home)
+        overrides = self._build_mcp_config_overrides()
+        cli_args = [sys.executable, "-I", str(Path(__file__).with_name("launcher.py"))]
+        for value in overrides:
+            cli_args.extend(["--config", value])
+        cli_args.extend(["app-server", "--listen", "stdio://"])
         self._codex = AsyncCodex(
             config=CodexConfig(
-                env=runtime_env,
-                config_overrides=self._build_mcp_config_overrides(),
+                env={"CODEX_HOME": str(self._codex_home)},
+                launch_args_override=tuple(cli_args),
             )
         )
 
@@ -90,6 +101,7 @@ class CodexRuntime:
             sandbox=self._sandbox_mode(),
             config=self._mcp_request_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
             cwd=str(self._workspace),
+            developer_instructions=self._developer_instructions,
         )
         started = await self._codex._client.thread_start(params)
         return started.thread.id
@@ -229,7 +241,9 @@ class CodexRuntime:
         )
 
     def _build_mcp_config_overrides(self) -> tuple[str, ...]:
-        overrides: list[str] = []
+        overrides = [
+            f"{key}={json.dumps(value)}" for key, value in business_runtime_config().items()
+        ]
         for server in self._definition.mcp_servers:
             prefix = f"mcp_servers.{server.name}"
             overrides.extend(
@@ -255,7 +269,7 @@ class CodexRuntime:
     ) -> dict[str, Any]:
         """把当前业务身份通过受控 HTTP Header 传给单 Agent 的 MCP Adapter。"""
 
-        config: dict[str, Any] = {}
+        config: dict[str, Any] = business_runtime_config()
         for server in self._definition.mcp_servers:
             config[f"mcp_servers.{server.name}.http_headers"] = {
                 "Authorization": f"Bearer {server.service_token}",
