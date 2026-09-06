@@ -23,6 +23,7 @@ public class TrustedMcpRequestContext {
         }
 
         HttpServletRequest request = attributes.getRequest();
+        requireAuthenticated(request);
         String userId = requireHeader(request, "X-User-Id");
         String tenantId = requireHeader(request, "X-Tenant-Id");
         String rolesHeader = request.getHeader("X-Roles");
@@ -35,6 +36,21 @@ public class TrustedMcpRequestContext {
                 .collect(Collectors.toUnmodifiableSet());
 
         return new BusinessIdentity(userId, tenantId, roles);
+    }
+
+    public String currentConversationId() {
+        if (!(RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attributes)) {
+            throw new IllegalStateException("当前 MCP Tool 调用缺少 HTTP 请求上下文");
+        }
+        requireAuthenticated(attributes.getRequest());
+        String value = requireHeader(attributes.getRequest(), "X-Conversation-Id");
+        return java.util.UUID.fromString(value).toString();
+    }
+
+    private static void requireAuthenticated(HttpServletRequest request) {
+        if (!Boolean.TRUE.equals(request.getAttribute(McpServiceAuthenticationFilter.AUTHENTICATED))) {
+            throw new IllegalStateException("MCP 请求尚未通过服务认证");
+        }
     }
 
     private static String requireHeader(HttpServletRequest request, String name) {

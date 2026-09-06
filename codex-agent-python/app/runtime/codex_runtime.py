@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +19,8 @@ from app.agents.definition import AgentDefinition, SandboxPolicy
 from app.events.codex_event_mapper import CodexEventMapper
 from app.events.models import AgentEvent
 from app.observability.tracing import get_tracer
+from app.runtime.admission import ExecutionFailed
+from app.runtime.policy import business_runtime_config
 
 
 class CodexRuntime:
@@ -31,7 +35,13 @@ class CodexRuntime:
         definition: AgentDefinition,
         codex_home: Path,
         approval_handler: Callable[[str, dict[str, Any] | None], dict[str, Any]],
+        developer_instructions: str | None = None,
     ) -> None:
+        if definition.sandbox != SandboxPolicy.READ_ONLY:
+            raise ValueError(
+                "Business Runtime requires READ_ONLY; local code needs a separate isolated runtime"
+            )
+        self._developer_instructions = developer_instructions
         self._definition = definition
         self._workspace = Path(definition.workspace).resolve()
         self._codex_home = codex_home.resolve()
@@ -42,12 +52,15 @@ class CodexRuntime:
         if not os.access(self._codex_home, os.W_OK):
             raise RuntimeError(f"Codex 持久化目录不可写: {self._codex_home}")
 
-        runtime_env = dict(os.environ)
-        runtime_env["CODEX_HOME"] = str(self._codex_home)
+        overrides = self._build_mcp_config_overrides()
+        cli_args = [sys.executable, "-I", str(Path(__file__).with_name("launcher.py"))]
+        for value in overrides:
+            cli_args.extend(["--config", value])
+        cli_args.extend(["app-server", "--listen", "stdio://"])
         self._codex = AsyncCodex(
             config=CodexConfig(
-                env=runtime_env,
-                config_overrides=self._build_mcp_config_overrides(),
+                env={"CODEX_HOME": str(self._codex_home)},
+                launch_args_override=tuple(cli_args),
             )
         )
 
@@ -62,7 +75,11 @@ class CodexRuntime:
 
     async def start(self) -> None:
         if not self._started:
-            await self._codex.__aenter__()
+            try:
+                await self._codex.__aenter__()
+            except BaseException:
+                await self._codex.__aexit__(None, None, None)
+                raise
             self._started = True
 
     async def close(self) -> None:
@@ -84,6 +101,7 @@ class CodexRuntime:
             sandbox=self._sandbox_mode(),
             config=self._mcp_request_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
             cwd=str(self._workspace),
+            developer_instructions=self._developer_instructions,
         )
         started = await self._codex._client.thread_start(params)
         return started.thread.id
@@ -123,7 +141,24 @@ class CodexRuntime:
             tenant_id=tenant_id,
             roles=roles,
         )
+        before = await thread.read(include_turns=True)
+        previous_ids = {turn.id for turn in before.thread.turns}
         await thread.compact()
+        # RPC acknowledgement is not completion. Keep admission until a new
+        # compaction Turn is terminal; the controller bounds this polling operation.
+        while True:
+            snapshot = await thread.read(include_turns=True)
+            for turn in snapshot.thread.turns:
+                if turn.id in previous_ids:
+                    continue
+                status = turn.status.value
+                if status in {"failed", "interrupted"}:
+                    raise ExecutionFailed("COMPACTION_FAILED")
+                if status == "completed" and any(
+                    item.model_dump().get("type") == "contextCompaction" for item in turn.items
+                ):
+                    return
+            await asyncio.sleep(0.25)
 
     async def run_turn(
         self,
@@ -142,10 +177,14 @@ class CodexRuntime:
                 user_id=user_id,
                 tenant_id=tenant_id,
                 roles=roles,
+                conversation_id=conversation_id,
             )
             result = await thread.run(message, sandbox=self._sandbox())
             span.set_attribute("agent.runtime.turn.id", result.id)
             span.set_attribute("agent.turn.status", str(result.status))
+            status = getattr(result.status, "value", result.status)
+            if status != "completed":
+                raise ExecutionFailed("TURN_FAILED")
             return result.final_response or ""
 
     async def stream_turn(
@@ -163,18 +202,24 @@ class CodexRuntime:
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
+            conversation_id=conversation_id,
         )
         turn = await thread.turn(message, sandbox=self._sandbox())
 
         with self._tracer.start_as_current_span("agent.turn.stream") as span:
             self._set_common_span_attributes(span, conversation_id, thread_id, user_id, tenant_id)
             span.set_attribute("agent.runtime.turn.id", turn.id)
+            completed = False
             async for notification in turn.stream():
                 event = self._event_mapper.map(notification, conversation_id)
                 if event is None:
                     continue
                 span.add_event(event.type)
+                if event.type == "turn.completed":
+                    completed = True
                 yield event
+            if not completed:
+                raise RuntimeError("INCOMPLETE_RUNTIME_STREAM")
 
     async def _resume_thread(
         self,
@@ -183,17 +228,22 @@ class CodexRuntime:
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
+        conversation_id: str | None = None,
     ) -> AsyncThread:
         self._ensure_started()
         return await self._codex.thread_resume(
             thread_id,
             cwd=str(self._workspace),
             sandbox=self._sandbox(),
-            config=self._mcp_request_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
+            config=self._mcp_request_config(
+                user_id=user_id, tenant_id=tenant_id, roles=roles, conversation_id=conversation_id
+            ),
         )
 
     def _build_mcp_config_overrides(self) -> tuple[str, ...]:
-        overrides: list[str] = []
+        overrides = [
+            f"{key}={json.dumps(value)}" for key, value in business_runtime_config().items()
+        ]
         for server in self._definition.mcp_servers:
             prefix = f"mcp_servers.{server.name}"
             overrides.extend(
@@ -215,10 +265,11 @@ class CodexRuntime:
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """把当前业务身份通过受控 HTTP Header 传给单 Agent 的 MCP Adapter。"""
 
-        config: dict[str, Any] = {}
+        config: dict[str, Any] = business_runtime_config()
         for server in self._definition.mcp_servers:
             config[f"mcp_servers.{server.name}.http_headers"] = {
                 "Authorization": f"Bearer {server.service_token}",
@@ -226,6 +277,10 @@ class CodexRuntime:
                 "X-Tenant-Id": tenant_id,
                 "X-Roles": ",".join(sorted(roles)),
             }
+            if conversation_id is not None:
+                config[f"mcp_servers.{server.name}.http_headers"]["X-Conversation-Id"] = (
+                    conversation_id
+                )
         return config
 
     def _sandbox(self) -> Sandbox:

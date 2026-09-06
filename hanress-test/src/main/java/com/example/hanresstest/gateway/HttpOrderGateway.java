@@ -21,7 +21,11 @@ public class HttpOrderGateway implements OrderGateway {
 
     public HttpOrderGateway(RestClient.Builder builder, OrderServiceProperties properties) {
         this.properties = properties;
-        this.restClient = builder
+        var factory = new org.springframework.http.client.JdkClientHttpRequestFactory(
+                java.net.http.HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5))
+                        .followRedirects(java.net.http.HttpClient.Redirect.NEVER).build());
+        factory.setReadTimeout(java.time.Duration.ofSeconds(15));
+        this.restClient = builder.clone().requestFactory(factory)
                 .baseUrl(properties.baseUrl())
                 .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + properties.serviceToken())
                 .build();
@@ -29,20 +33,33 @@ public class HttpOrderGateway implements OrderGateway {
 
     @Override
     public JsonNode getOrderStatus(String orderId, BusinessIdentity identity) {
-        return restClient.get()
+        return safeResponse(() -> restClient.get()
                 .uri(properties.statusPath(), orderId)
                 .headers(headers -> applyIdentity(headers, identity))
                 .retrieve()
-                .body(JsonNode.class);
+                .body(JsonNode.class));
     }
 
     @Override
-    public JsonNode cancelOrder(String orderId, BusinessIdentity identity) {
-        return restClient.post()
+    public JsonNode cancelOrder(String orderId, BusinessIdentity identity, java.util.UUID executionId) {
+        java.util.Objects.requireNonNull(executionId, "执行 ID 不能为空");
+        return safeResponse(() -> restClient.post()
                 .uri(properties.cancelPath(), orderId)
+                .header("Idempotency-Key", executionId.toString())
                 .headers(headers -> applyIdentity(headers, identity))
                 .retrieve()
-                .body(JsonNode.class);
+                .body(JsonNode.class));
+    }
+
+    private static JsonNode safeResponse(java.util.function.Supplier<JsonNode> call) {
+        try {
+            JsonNode result = call.get();
+            if (result == null) throw new IllegalStateException("ORDER_EMPTY_RESPONSE");
+            return result;
+        } catch (org.springframework.web.client.RestClientException exception) {
+            // Downstream error bodies/URLs must never become model-visible tool errors.
+            throw new IllegalStateException("ORDER_SERVICE_UNAVAILABLE");
+        }
     }
 
     private static void applyIdentity(HttpHeaders headers, BusinessIdentity identity) {

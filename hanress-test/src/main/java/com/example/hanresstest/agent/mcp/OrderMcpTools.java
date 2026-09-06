@@ -44,6 +44,6 @@ public class OrderMcpTools {
             @ToolParam(description = "业务订单ID") String orderId
     ) {
         BusinessIdentity identity = requestContext.currentIdentity();
-        return orderService.cancelOrder(orderId, identity);
+        return orderService.cancelOrder(orderId, identity, requestContext.currentConversationId());
     }
 }

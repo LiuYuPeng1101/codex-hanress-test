@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,6 +11,15 @@ class Settings(BaseSettings):
     app_name: str = "Codex Single Agent Service"
     app_env: str = "production"
     api_prefix: str = "/api/v1"
+
+    database_connect_seconds: int = Field(default=3, ge=1, le=10)
+    database_pool_seconds: float = Field(default=2, gt=0, le=10)
+    database_statement_ms: int = Field(default=5000, ge=100, le=10000)
+    database_lock_ms: int = Field(default=1000, ge=100, le=10000)
+
+    max_active_operations: int = Field(default=8, ge=1, le=1024)
+    operation_timeout_seconds: float = Field(default=180.0, gt=0, le=3600)
+    shutdown_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
 
     agent_id: str = "order-agent"
     agent_workspace: Path = Path(".")
@@ -28,7 +37,19 @@ class Settings(BaseSettings):
         description="业务系统调用本 Agent Service 的服务认证密钥",
     )
 
+    execution_service_secret: str = Field(
+        min_length=32,
+        description="仅 MCP Adapter 可用的执行授权 API 密钥",
+    )
+    execution_grant_ttl_seconds: int = Field(default=86400, ge=60, le=604800)
+
     otel_exporter_otlp_traces_endpoint: str | None = None
+
+    @model_validator(mode="after")
+    def distinct_execution_credential(self):
+        if self.execution_service_secret in {self.api_shared_secret, self.order_mcp_service_token}:
+            raise ValueError("执行授权密钥必须与公开 API 和 MCP 认证密钥不同")
+        return self
 
     model_config = SettingsConfigDict(
         env_file=".env",

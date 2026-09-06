@@ -10,12 +10,13 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
-    create_engine,
     insert,
     select,
     text,
 )
 from sqlalchemy.engine import Engine
+
+from app.core.database import DatabasePolicy, database_engine
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,8 +50,8 @@ class ConversationRepository:
     不承担多 Runtime 路由、Lease、Scheduler 或 Agent Registry 职责。
     """
 
-    def __init__(self, database_url: str) -> None:
-        self._engine: Engine = create_engine(database_url, pool_pre_ping=True)
+    def __init__(self, database_url: str, policy: DatabasePolicy | None = None) -> None:
+        self._engine: Engine = database_engine(database_url, policy)
 
     def healthcheck(self) -> None:
         with self._engine.connect() as conn:
@@ -105,9 +106,7 @@ class ConversationRepository:
         return self._from_row(row)
 
     def find_by_runtime_thread_id(self, runtime_thread_id: str) -> Conversation:
-        stmt = select(conversations).where(
-            conversations.c.runtime_thread_id == runtime_thread_id
-        )
+        stmt = select(conversations).where(conversations.c.runtime_thread_id == runtime_thread_id)
         with self._engine.connect() as conn:
             row = conn.execute(stmt).mappings().one_or_none()
         if row is None:

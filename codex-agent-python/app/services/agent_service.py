@@ -1,9 +1,13 @@
 from collections.abc import AsyncIterator
 from typing import Any
 
+from starlette.concurrency import run_in_threadpool
+
 from app.conversations.conversation_repository import Conversation, ConversationRepository
 from app.events.models import AgentEvent
-from app.runtime.codex_runtime import CodexRuntime
+from app.runtime.admission import AdmissionController, ExecutionFailed
+from app.runtime.event_subscription import EventSubscription
+from app.runtime.ports import AgentRuntime
 
 
 class AgentService:
@@ -15,11 +19,13 @@ class AgentService:
 
     def __init__(
         self,
-        runtime: CodexRuntime,
+        runtime: AgentRuntime,
         conversations: ConversationRepository,
+        admission: AdmissionController | None = None,
     ) -> None:
         self._runtime = runtime
         self._conversations = conversations
+        self.admission = admission if admission is not None else AdmissionController(8)
 
     async def create_conversation(
         self,
@@ -29,13 +35,26 @@ class AgentService:
         roles: frozenset[str],
     ) -> Conversation:
         conversation_id = self._conversations.new_id()
+        return await self.admission.run(
+            conversation_id,
+            lambda: self._create_conversation(conversation_id, tenant_id, user_id, roles),
+        )
+
+    async def _create_conversation(
+        self,
+        conversation_id: str,
+        tenant_id: str,
+        user_id: str,
+        roles: frozenset[str],
+    ) -> Conversation:
         runtime_thread_id = await self._runtime.create_thread(
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
         )
         try:
-            return self._conversations.create(
+            return await run_in_threadpool(
+                self._conversations.create,
                 conversation_id=conversation_id,
                 tenant_id=tenant_id,
                 user_id=user_id,
@@ -55,16 +74,20 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> dict[str, Any]:
-        conversation = self._resolve_owned(
+        conversation = await run_in_threadpool(
+            self._resolve_owned,
             conversation_id,
             tenant_id=tenant_id,
             user_id=user_id,
         )
-        return await self._runtime.read_thread(
-            conversation.runtime_thread_id,
-            user_id=user_id,
-            tenant_id=tenant_id,
-            roles=roles,
+        return await self.admission.run(
+            conversation.id,
+            lambda: self._runtime.read_thread(
+                conversation.runtime_thread_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
+            ),
         )
 
     async def compact_conversation(
@@ -75,16 +98,20 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> None:
-        conversation = self._resolve_owned(
+        conversation = await run_in_threadpool(
+            self._resolve_owned,
             conversation_id,
             tenant_id=tenant_id,
             user_id=user_id,
         )
-        await self._runtime.compact_thread(
-            conversation.runtime_thread_id,
-            user_id=user_id,
-            tenant_id=tenant_id,
-            roles=roles,
+        await self.admission.run(
+            conversation.id,
+            lambda: self._runtime.compact_thread(
+                conversation.runtime_thread_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
+            ),
         )
 
     async def chat(
@@ -96,19 +123,63 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> str:
-        conversation = self._resolve_owned(
+        conversation = await run_in_threadpool(
+            self._resolve_owned,
             conversation_id,
             tenant_id=tenant_id,
             user_id=user_id,
         )
-        return await self._runtime.run_turn(
-            conversation.runtime_thread_id,
+        return await self.admission.run(
             conversation.id,
-            message,
-            user_id=user_id,
-            tenant_id=tenant_id,
-            roles=roles,
+            lambda: self._runtime.run_turn(
+                conversation.runtime_thread_id,
+                conversation.id,
+                message,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                roles=roles,
+            ),
         )
+
+    async def open_stream(
+        self,
+        conversation_id: str,
+        message: str,
+        *,
+        tenant_id: str,
+        user_id: str,
+        roles: frozenset[str],
+    ) -> EventSubscription:
+        conversation = await run_in_threadpool(
+            self._resolve_owned,
+            conversation_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        subscription = EventSubscription(conversation_id)
+
+        async def produce() -> None:
+            try:
+                async for event in self._runtime.stream_turn(
+                    conversation.runtime_thread_id,
+                    conversation.id,
+                    message,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    roles=roles,
+                ):
+                    subscription.publish(event)
+            except ExecutionFailed:
+                subscription.finish("TURN_FAILED")
+                raise
+            except BaseException:
+                subscription.finish("RUNTIME_UNAVAILABLE")
+                raise
+            else:
+                subscription.finish()
+
+        self.admission.submit(conversation.id, produce)
+        return subscription
 
     async def stream_chat(
         self,
@@ -119,20 +190,18 @@ class AgentService:
         user_id: str,
         roles: frozenset[str],
     ) -> AsyncIterator[AgentEvent]:
-        conversation = self._resolve_owned(
+        subscription = await self.open_stream(
             conversation_id,
-            tenant_id=tenant_id,
-            user_id=user_id,
-        )
-        async for event in self._runtime.stream_turn(
-            conversation.runtime_thread_id,
-            conversation.id,
             message,
-            user_id=user_id,
             tenant_id=tenant_id,
+            user_id=user_id,
             roles=roles,
-        ):
-            yield event
+        )
+        try:
+            async for event in subscription.events():
+                yield event
+        finally:
+            subscription.aclose()
 
     def _resolve_owned(
         self,

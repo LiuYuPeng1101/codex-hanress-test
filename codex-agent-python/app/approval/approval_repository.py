@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import (
@@ -11,20 +12,26 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
-    create_engine,
+    func,
     insert,
+    or_,
     select,
     text,
+    tuple_,
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
+
+from app.core.database import DatabasePolicy, database_engine
+from app.executions.service import ExecutionDecision
 
 
 @dataclass(frozen=True, slots=True)
 class ApprovalRequest:
-    """持久化审批记录，同时也是一次性高风险动作授权。"""
+    """持久化审批及执行 ID；CONSUMED 只表示已签发，不能解释为业务成功。"""
 
     id: str
     approval_key: str
@@ -42,6 +49,10 @@ class ApprovalRequest:
     decision: str | None
     decided_by: str | None
     consumed_at: datetime | None
+    execution_id: str | None = None
+    operation: str | None = None
+    operation_arguments: dict[str, Any] | None = None
+    expires_at: datetime | None = None
 
 
 metadata = MetaData()
@@ -65,23 +76,32 @@ approval_requests = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("decided_at", DateTime(timezone=True), nullable=True),
     Column("consumed_at", DateTime(timezone=True), nullable=True),
+    Column("execution_id", String(36)),
+    Column("operation", String(128)),
+    Column("operation_arguments", JSONB),
+    Column("expires_at", DateTime(timezone=True)),
 )
 
 
 class ApprovalRepository:
-    """基于 PostgreSQL 的多租户审批仓储。
+    """PostgreSQL 是审批与执行 ID 的事实源；业务提交状态仍由 OMS 拥有。
 
-    Human Approval 不依赖某个 Python 进程内的等待对象。APPROVED 是一个持久化的一次性 grant；
-    下次完全相同的高风险动作请求到达时，Runtime 原子消费它并继续执行。
+    新授权由 prepare_execution 原子签发并稳定重放。旧 SDK grant 方法仅保留历史兼容，
+    当前 Runtime callback 不再创建或消费它们。
     """
 
-    def __init__(self, database_url: str) -> None:
-        self._engine: Engine = create_engine(database_url, pool_pre_ping=True)
+    def __init__(self, database_url: str, policy: DatabasePolicy | None = None) -> None:
+        self._engine: Engine = database_engine(database_url, policy)
 
     def healthcheck(self) -> None:
         with self._engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-            conn.execute(text("SELECT id FROM approval_requests LIMIT 1"))
+            conn.execute(
+                text(
+                    "SELECT id, execution_id, operation, operation_arguments, expires_at "
+                    "FROM approval_requests LIMIT 1"
+                )
+            )
 
     def close(self) -> None:
         self._engine.dispose()
@@ -140,6 +160,85 @@ class ApprovalRepository:
                 raise
             return existing
 
+    def prepare_execution(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        tenant_id: str,
+        approval_key: str,
+        operation: str,
+        arguments: dict[str, Any],
+        ttl_seconds: int,
+    ) -> ExecutionDecision:
+        """Create/check a grant and reserve its execution ID in one PostgreSQL transaction.
+
+        CONSUMED means an ID was issued, not that OMS committed the operation. Replays
+        return the same ID; no local success cache pretends to own OMS state.
+        """
+        with self._engine.begin() as conn:
+            # Database time is the authority for grant expiry across service instances.
+            now = conn.execute(select(func.clock_timestamp())).scalar_one()
+            conn.execute(
+                pg_insert(approval_requests)
+                .values(
+                    id=str(uuid.uuid4()),
+                    execution_id=str(uuid.uuid4()),
+                    approval_key=approval_key,
+                    conversation_id=conversation_id,
+                    requester_user_id=user_id,
+                    tenant_id=tenant_id,
+                    method="business/execution",
+                    server_name=None,
+                    params={
+                        "message": f"{operation}: " + json.dumps(arguments, ensure_ascii=False)
+                    },
+                    operation=operation,
+                    operation_arguments=arguments,
+                    status="PENDING",
+                    created_at=now,
+                    expires_at=now + timedelta(seconds=ttl_seconds),
+                )
+                .on_conflict_do_nothing()
+            )
+            row = (
+                conn.execute(
+                    select(approval_requests)
+                    .where(
+                        approval_requests.c.conversation_id == conversation_id,
+                        approval_requests.c.approval_key == approval_key,
+                        approval_requests.c.execution_id.is_not(None),
+                        approval_requests.c.tenant_id == tenant_id,
+                        approval_requests.c.requester_user_id == user_id,
+                    )
+                    .with_for_update()
+                )
+                .mappings()
+                .one()
+            )
+            now = conn.execute(select(func.clock_timestamp())).scalar_one()
+            if row["expires_at"] <= now:
+                status = "EXPIRED"
+            elif row["status"] == "APPROVED":
+                conn.execute(
+                    update(approval_requests)
+                    .where(
+                        approval_requests.c.id == row["id"],
+                    )
+                    .values(status="CONSUMED", consumed_at=now)
+                )
+                status = "AUTHORIZED"
+            elif row["status"] == "CONSUMED":
+                status = "AUTHORIZED"
+            else:
+                status = row["status"]
+            return ExecutionDecision(
+                status=status,
+                approval_id=row["id"],
+                execution_id=row["execution_id"] if status == "AUTHORIZED" else None,
+                expires_at=row["expires_at"],
+            )
+
     def find_actionable(self, conversation_id: str, approval_key: str) -> ApprovalRequest | None:
         """查找同一业务动作当前尚未结束的 PENDING / APPROVED grant。"""
 
@@ -166,6 +265,7 @@ class ApprovalRepository:
             .where(
                 approval_requests.c.id == approval_id,
                 approval_requests.c.status == "APPROVED",
+                approval_requests.c.execution_id.is_(None),
             )
             .values(status="CONSUMED", consumed_at=now)
             .returning(*approval_requests.c)
@@ -174,16 +274,55 @@ class ApprovalRepository:
             row = conn.execute(stmt).mappings().one_or_none()
         return self._from_row(row) if row is not None else None
 
-    def list_for_tenant(self, tenant_id: str, limit: int = 100) -> list[ApprovalRequest]:
-        stmt = (
-            select(approval_requests)
-            .where(approval_requests.c.tenant_id == tenant_id)
-            .order_by(approval_requests.c.created_at.desc())
-            .limit(limit)
-        )
+    def list_for_tenant(
+        self,
+        tenant_id: str,
+        limit: int = 100,
+        *,
+        status: str | None = None,
+        conversation_id: str | None = None,
+        before: tuple[datetime, str] | None = None,
+    ) -> list[ApprovalRequest]:
+        if not 1 <= limit <= 201:
+            raise ValueError("Invalid page size")
+        stmt = select(approval_requests).where(approval_requests.c.tenant_id == tenant_id)
+        if status is not None:
+            stmt = stmt.where(approval_requests.c.status == status)
+            if status == "PENDING":
+                stmt = stmt.where(
+                    or_(
+                        approval_requests.c.expires_at.is_(None),
+                        approval_requests.c.expires_at > func.clock_timestamp(),
+                    )
+                )
+        if conversation_id is not None:
+            stmt = stmt.where(approval_requests.c.conversation_id == conversation_id)
+        if before is not None:
+            stmt = stmt.where(
+                tuple_(approval_requests.c.created_at, approval_requests.c.id) < before
+            )
+        stmt = stmt.order_by(
+            approval_requests.c.created_at.desc(), approval_requests.c.id.desc()
+        ).limit(limit)
         with self._engine.connect() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [self._from_row(row) for row in rows]
+
+    def get_for_tenant(self, approval_id: str, tenant_id: str) -> ApprovalRequest:
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(
+                    select(approval_requests).where(
+                        approval_requests.c.id == approval_id,
+                        approval_requests.c.tenant_id == tenant_id,
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None:
+            raise KeyError(approval_id)
+        return self._from_row(row)
 
     def get(self, approval_id: str) -> ApprovalRequest:
         stmt = select(approval_requests).where(approval_requests.c.id == approval_id)
@@ -212,6 +351,10 @@ class ApprovalRepository:
                 approval_requests.c.id == approval_id,
                 approval_requests.c.tenant_id == tenant_id,
                 approval_requests.c.status == "PENDING",
+                or_(
+                    approval_requests.c.expires_at.is_(None),
+                    approval_requests.c.expires_at > func.clock_timestamp(),
+                ),
             )
             .values(
                 status=new_status,
@@ -227,6 +370,8 @@ class ApprovalRepository:
             existing = self.get(approval_id)
             if existing.tenant_id != tenant_id:
                 raise KeyError(approval_id)
+            if existing.expires_at and existing.expires_at <= datetime.now(timezone.utc):
+                raise ValueError("审批已过期，不能执行")
             if existing.status != "PENDING":
                 raise ValueError("该审批已经处理，不能重复审批")
             raise RuntimeError("审批状态更新失败")
@@ -259,4 +404,8 @@ class ApprovalRepository:
             decision=row["decision"],
             decided_by=row["decided_by"],
             consumed_at=row["consumed_at"],
+            execution_id=row["execution_id"],
+            operation=row["operation"],
+            operation_arguments=row["operation_arguments"],
+            expires_at=row["expires_at"],
         )

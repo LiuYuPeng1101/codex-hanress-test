@@ -18,3 +18,7 @@ def get_approval_service(request: Request) -> ApprovalService:
     """
 
     return request.app.state.approval_service
+
+
+def get_execution_service(request: Request):
+    return request.app.state.execution_service

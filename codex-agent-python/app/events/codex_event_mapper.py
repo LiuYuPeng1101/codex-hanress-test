@@ -23,17 +23,21 @@ class CodexEventMapper:
         if method not in self._SUPPORTED_METHODS:
             return None
 
-        params = self._to_dict(getattr(notification, "params", None))
+        params = self._to_dict(getattr(notification, "payload", None))
 
         if method == "turn/started":
             return AgentEvent("turn.started", conversation_id)
 
         if method == "turn/completed":
             turn = self._to_dict(params.get("turn"))
+            data = self._pick(turn, "status", "durationMs")
+            if turn.get("error"):
+                # Provider errors may contain URLs, credentials or business data.
+                data["error"] = {"code": "TURN_FAILED"}
             return AgentEvent(
                 "turn.completed",
                 conversation_id,
-                self._pick(turn, "status", "error", "durationMs"),
+                data,
             )
 
         if method == "item/agentMessage/delta":
@@ -55,7 +59,7 @@ class CodexEventMapper:
             data.update(
                 {
                     "server": item.get("server"),
-                    "tool_name": item.get("toolName") or item.get("tool_name"),
+                    "tool_name": item.get("tool"),
                     "status": item.get("status"),
                 }
             )

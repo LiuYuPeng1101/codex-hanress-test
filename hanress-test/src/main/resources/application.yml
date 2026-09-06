@@ -22,3 +22,9 @@ order-service:
   service-token: ${ORDER_SERVICE_TOKEN}
   status-path: ${ORDER_STATUS_PATH:/api/orders/{orderId}/status}
   cancel-path: ${ORDER_CANCEL_PATH:/api/orders/{orderId}/cancel}
+
+# MCP Adapter -> Agent Service authorization (distinct from public API credentials).
+execution-service:
+  base-url: ${EXECUTION_SERVICE_BASE_URL}
+  service-token: ${EXECUTION_SERVICE_SECRET}
+  prepare-path: ${EXECUTION_SERVICE_PREPARE_PATH:/api/v1/internal/executions/prepare}

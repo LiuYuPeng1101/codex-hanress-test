@@ -21,6 +21,8 @@ import java.security.MessageDigest;
 @Component
 public class McpServiceAuthenticationFilter extends OncePerRequestFilter {
 
+    static final String AUTHENTICATED = McpServiceAuthenticationFilter.class.getName() + ".authenticated";
+
     private final McpSecurityProperties properties;
 
     public McpServiceAuthenticationFilter(McpSecurityProperties properties) {
@@ -44,6 +46,7 @@ public class McpServiceAuthenticationFilter extends OncePerRequestFilter {
             response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "MCP service authentication failed");
             return;
         }
+        request.setAttribute(AUTHENTICATED, Boolean.TRUE);
         filterChain.doFilter(request, response);
     }
 

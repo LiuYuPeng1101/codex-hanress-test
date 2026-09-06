@@ -32,7 +32,7 @@ jobs:
           cache-dependency-path: codex-agent-python/pyproject.toml
       - name: Install Python dependencies
         working-directory: codex-agent-python
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,eval]"
       - name: Apply database migrations
         env:
           PGPASSWORD: agent
@@ -42,7 +42,7 @@ jobs:
           done
       - name: Ruff
         working-directory: codex-agent-python
-        run: ruff check app tests
+        run: ruff check app tests evals
       - name: Pytest
         working-directory: codex-agent-python
         env:

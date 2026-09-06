@@ -25,7 +25,7 @@ class CompactConversationResponse(BaseModel):
 
 
 class RunTurnRequest(BaseModel):
-    message: str = Field(min_length=1, description="用户输入")
+    message: str = Field(min_length=1, max_length=32000, description="用户输入")
 
 
 class RunTurnResponse(BaseModel):
