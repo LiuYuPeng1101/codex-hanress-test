@@ -9,6 +9,8 @@ from app.approval.approval_repository import ApprovalRepository
 from app.approval.approval_service import ApprovalService
 from app.conversations.conversation_repository import ConversationRepository
 from app.core.config import get_settings
+from app.executions.order_policy import validate_cancel_order
+from app.executions.service import ExecutionService
 from app.observability.tracing import configure_tracing
 from app.runtime.admission import AdmissionController
 from app.runtime.codex_runtime import CodexRuntime
@@ -50,7 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     enabled_tools=("get_order_status", "cancel_order"),
                     tool_approval_modes=(
                         ("get_order_status", "approve"),
-                        ("cancel_order", "prompt"),
+                        ("cancel_order", "approve"),
                     ),
                 ),
             ),
@@ -70,6 +72,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         agent_service = AgentService(runtime, conversation_repository, admission)
 
+        app.state.execution_service = ExecutionService(
+            approval_repository,
+            conversation_repository,
+            {"order.cancel": validate_cancel_order},
+            settings.execution_grant_ttl_seconds,
+        )
         app.state.approval_service = approval_service
         app.state.codex_runtime = runtime
         app.state.agent_service = agent_service

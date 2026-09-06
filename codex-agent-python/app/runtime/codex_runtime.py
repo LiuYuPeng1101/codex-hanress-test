@@ -165,6 +165,7 @@ class CodexRuntime:
                 user_id=user_id,
                 tenant_id=tenant_id,
                 roles=roles,
+                conversation_id=conversation_id,
             )
             result = await thread.run(message, sandbox=self._sandbox())
             span.set_attribute("agent.runtime.turn.id", result.id)
@@ -189,6 +190,7 @@ class CodexRuntime:
             user_id=user_id,
             tenant_id=tenant_id,
             roles=roles,
+            conversation_id=conversation_id,
         )
         turn = await thread.turn(message, sandbox=self._sandbox())
 
@@ -214,13 +216,16 @@ class CodexRuntime:
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
+        conversation_id: str | None = None,
     ) -> AsyncThread:
         self._ensure_started()
         return await self._codex.thread_resume(
             thread_id,
             cwd=str(self._workspace),
             sandbox=self._sandbox(),
-            config=self._mcp_request_config(user_id=user_id, tenant_id=tenant_id, roles=roles),
+            config=self._mcp_request_config(
+                user_id=user_id, tenant_id=tenant_id, roles=roles, conversation_id=conversation_id
+            ),
         )
 
     def _build_mcp_config_overrides(self) -> tuple[str, ...]:
@@ -246,6 +251,7 @@ class CodexRuntime:
         user_id: str,
         tenant_id: str,
         roles: frozenset[str],
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """把当前业务身份通过受控 HTTP Header 传给单 Agent 的 MCP Adapter。"""
 
@@ -257,6 +263,10 @@ class CodexRuntime:
                 "X-Tenant-Id": tenant_id,
                 "X-Roles": ",".join(sorted(roles)),
             }
+            if conversation_id is not None:
+                config[f"mcp_servers.{server.name}.http_headers"]["X-Conversation-Id"] = (
+                    conversation_id
+                )
         return config
 
     def _sandbox(self) -> Sandbox:

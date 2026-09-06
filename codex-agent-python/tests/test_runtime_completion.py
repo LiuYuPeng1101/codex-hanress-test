@@ -49,3 +49,40 @@ async def test_sync_turn_does_not_report_failed_run_as_empty_success():
         await runtime_with_thread(thread).run_turn(
             "t", "c", "query", user_id="u", tenant_id="t", roles=frozenset()
         )
+
+
+async def test_turn_binds_conversation_to_trusted_mcp_configuration():
+    from app.agents.definition import AgentDefinition, McpServerDefinition, SandboxPolicy
+
+    thread = NS(run=AsyncMock(return_value=NS(id="turn", status="completed", final_response="ok")))
+    runtime = runtime_with_thread(thread)
+    await runtime.run_turn(
+        "runtime-thread",
+        "business-conversation",
+        "query",
+        user_id="u",
+        tenant_id="t",
+        roles=frozenset(),
+    )
+    assert runtime._resume_thread.call_args.kwargs["conversation_id"] == "business-conversation"
+    runtime._definition = AgentDefinition(
+        agent_id="order",
+        workspace=".",
+        sandbox=SandboxPolicy.READ_ONLY,
+        mcp_servers=(
+            McpServerDefinition(
+                name="order",
+                url="http://mcp/mcp",
+                service_token="trusted-token-with-at-least-32-characters",
+                enabled_tools=("cancel_order",),
+                tool_approval_modes=(("cancel_order", "approve"),),
+            ),
+        ),
+    )
+    config = runtime._mcp_request_config(
+        user_id="u", tenant_id="t", roles=frozenset(), conversation_id="business-conversation"
+    )
+    headers = config["mcp_servers.order.http_headers"]
+    assert headers["X-Conversation-Id"] == "business-conversation"
+    assert headers["X-User-Id"] == "u"
+    assert headers["Authorization"] == "Bearer trusted-token-with-at-least-32-characters"

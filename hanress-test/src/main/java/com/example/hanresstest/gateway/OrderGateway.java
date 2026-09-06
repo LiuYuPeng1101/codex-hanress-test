@@ -12,5 +12,5 @@ public interface OrderGateway {
 
     JsonNode getOrderStatus(String orderId, BusinessIdentity identity);
 
-    JsonNode cancelOrder(String orderId, BusinessIdentity identity);
+    JsonNode cancelOrder(String orderId, BusinessIdentity identity, java.util.UUID executionId);
 }

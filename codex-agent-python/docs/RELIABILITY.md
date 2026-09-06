@@ -6,6 +6,7 @@
 
 | 模块 | 职责 | 换业务 Agent 时 |
 |---|---|---|
+| `app/executions/service.py` | 操作注册、会话归属、参数指纹与持久化授权端口 | 复用，业务校验器另行实现 |
 | `app/runtime/ports.py` | 应用层依赖的 Runtime Protocol，无 Codex SDK 类型 | 复用 |
 | `app/runtime/admission.py` | 每个会话互斥、总并发上限、执行期限、停止接单与排空 | 复用 |
 | `app/runtime/event_subscription.py` | 有界 SSE 订阅、慢消费者处理、断线与执行解耦 | 复用 |
@@ -70,7 +71,7 @@ Spring Boot 4 的服务端 Web MVC starter 并不代替 RestClient starter。本
 
 ## 仍然需要完成的上线工作
 
-1. 写操作 execution_id / idempotency_key 贯穿审批、MCP 和真实 OMS，并由 OMS 原子去重。
+1. 审批与 Adapter 已贯穿 execution_id / Idempotency-Key；仍须真实 OMS 实现原子去重并完成验收，见 [执行幂等契约](EXECUTION_CONTRACT.md)。
 2. 审批到实际工具执行的完整验收；Tool timeout/retry 策略及恶意 Tool Result fixture。
 3. 企业身份验证、密钥管理、网络边界与日志脱敏验收。
 4. CODEX_HOME 和 PostgreSQL 的部署、备份、崩溃恢复演练。

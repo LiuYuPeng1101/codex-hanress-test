@@ -25,6 +25,9 @@ def _to_response(item: ApprovalRequest) -> ApprovalResponse:
         decided_at=item.decided_at,
         decision=item.decision,
         decided_by=item.decided_by,
+        operation=item.operation,
+        operation_arguments=item.operation_arguments,
+        expires_at=item.expires_at,
     )
 
 

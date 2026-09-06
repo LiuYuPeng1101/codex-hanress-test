@@ -1,115 +1,34 @@
-# Codex MCP Tool Approval
+# 业务审批与执行授权
 
-当前策略：
+业务写操作的最终审批检查位于 MCP Adapter 的应用服务。SDK elicitation 的描述文本不能可靠标识工具；当前 callback 拒绝此类请求，也拒绝本地命令/文件变更提权。历史 SDK 审批不升级为新授权。
 
-```text
-get_order_status
-→ approval_mode=approve
-→ 自动执行
+`get_order_status` 和 `cancel_order` 的 Codex 工具策略均为 `approve`，表示允许调用 Adapter。`cancel_order` 在 Adapter 内仍必须取得人工批准的执行 ID，才能向 OMS 发请求。此检查不依赖模型是否遵守提示词。
 
-cancel_order
-→ approval_mode=prompt
-→ Human-in-the-loop
-```
+1. Runtime 将可信用户、租户、角色与 `X-Conversation-Id` 注入 MCP HTTP Header；模型只提供 `orderId`。
+2. Adapter 使用独立内部密钥调用执行授权接口。服务校验会话归属，使用注册操作 `order.cancel` 及严格验证的参数生成指纹。
+3. PostgreSQL 创建 `PENDING` 记录及固定执行 ID。返回 `PENDING` 和 `approval_id`，不返回执行 ID；Adapter 不访问 OMS。
+4. 有 `agent.approver` 角色的业务用户调用现有 approve/reject API，只能处理所属租户、未过期的待审批记录。
+5. 批准后再次请求同一会话的相同动作。事务锁定记录，将 `APPROVED` 变为 `CONSUMED`，签发固定执行 ID。后续重试在有效期内返回同一 ID。
+6. Adapter 将该 ID 作为 `Idempotency-Key` 传给 OMS。OMS 独立验证业务权限、订单状态并执行原子去重。
 
-## Codex 侧执行链
+| 状态 | 执行授权 API | 能否调用 OMS |
+|---|---|---|
+| PENDING | PENDING，无执行 ID | 否 |
+| APPROVED | 原子签发，返回 AUTHORIZED | 是，使用固定 ID |
+| CONSUMED | AUTHORIZED，重放固定 ID | 是，OMS 必须去重 |
+| REJECTED | REJECTED，无执行 ID | 否 |
+| 任意已过期记录 | EXPIRED，无执行 ID | 否 |
 
-```text
-Codex Harness
- ↓
-cancel_order
- ↓
-approval_mode=prompt
- ↓
-mcpServer/elicitation/request
- ↓
-meta.codex_approval_kind=mcp_tool_call
- ↓
-ApprovalService
- ↓
-PostgreSQL approval_requests
- ↓
-PENDING
- ↓
-人工 approve / reject
- ↓
-accept / decline
- ↓
-Codex 决定是否真正调用 MCP Tool
-```
+`CONSUMED` **只表示执行 ID 已签发，不表示订单已取消**。终态记录保留在唯一约束内；拒绝、过期、网络超时、进程重启都不会自动生成新 ID。过期是按 `expires_at` 计算的授权结果，不依赖定时任务修改数据库 status；审批页面应展示 expiry 字段。
 
-批准：
+默认授权期限从申请创建起 24 小时，配置为 `EXECUTION_GRANT_TTL_SECONDS`。数据库时间决定签发和审批的有效性；Adapter 还会拒绝已过期的授权响应，主机应保持时钟同步。超时后先查询 OMS，禁止把新会话当作绕过去重的重试方式。
 
-```http
-POST /api/v1/approvals/{approval_id}/approve
-```
+审批页面使用以下既有接口，Authorization 为公开 API 服务密钥并携带可信业务身份及 `agent.approver` 角色：
 
-拒绝：
+- `GET /api/v1/approvals`
+- `POST /api/v1/approvals/{approval_id}/approve`
+- `POST /api/v1/approvals/{approval_id}/reject`
 
-```http
-POST /api/v1/approvals/{approval_id}/reject
-```
+页面响应增加结构化 `operation`、`operation_arguments`、`expires_at`，不暴露执行 ID 或原始 SDK params。人工批准不会自动启动 Turn；业务客户端按现有会话继续请求。
 
-## 持久化原则
-
-审批记录使用 PostgreSQL 作为事实来源，不使用进程内 Map / Event 保存业务状态。
-
-数据库迁移：
-
-```text
-migrations/001_create_approval_requests.sql
-```
-
-决策更新必须满足：
-
-```text
-WHERE status = PENDING
-```
-
-避免多个实例或重复请求覆盖已经完成的审批。
-
-超过 `APPROVAL_TIMEOUT_SECONDS` 仍未得到决策时，审批转为 `EXPIRED` 并向 Codex 返回 `decline`。
-
-## 多实例边界
-
-数据库持久化可以让多个 Agent Service 实例共享审批记录，但不能单独解决“活跃 Turn 所属 Runtime 实例死亡”的问题。
-
-活跃 Codex Turn 仍然属于运行它的 Runtime / App Server 进程。生产集群还需要：
-
-```text
-runtime_instance_id
-Thread ownership / lease
-Runtime routing
-失败实例检测
-可恢复 Run 状态
-```
-
-这些属于后续 Agent Gateway / 多实例 Runtime 控制面。
-
-## Approval 不是业务授权
-
-即使 Codex Approval 已经通过，真实业务系统仍然必须校验：
-
-```text
-认证用户
-Tenant
-RBAC / ABAC
-订单归属
-订单状态
-金额 / 风险阈值
-业务规则
-```
-
-推荐链路：
-
-```text
-Agent Policy / Approval
- ↓
-MCP
- ↓
-Trusted Identity Context
- ↓
-Business Authorization
- ↓
-Business Service
-```
+完整接口、升级次序、复用及 OMS 验收要求见 [执行幂等契约](EXECUTION_CONTRACT.md)。数据库的并发安全不改变 [单 Runtime 部署边界](RELIABILITY.md)。

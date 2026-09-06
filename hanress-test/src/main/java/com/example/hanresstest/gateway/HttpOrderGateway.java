@@ -21,7 +21,11 @@ public class HttpOrderGateway implements OrderGateway {
 
     public HttpOrderGateway(RestClient.Builder builder, OrderServiceProperties properties) {
         this.properties = properties;
-        this.restClient = builder
+        var factory = new org.springframework.http.client.JdkClientHttpRequestFactory(
+                java.net.http.HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5))
+                        .followRedirects(java.net.http.HttpClient.Redirect.NEVER).build());
+        factory.setReadTimeout(java.time.Duration.ofSeconds(15));
+        this.restClient = builder.clone().requestFactory(factory)
                 .baseUrl(properties.baseUrl())
                 .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + properties.serviceToken())
                 .build();
@@ -37,8 +41,10 @@ public class HttpOrderGateway implements OrderGateway {
     }
 
     @Override
-    public JsonNode cancelOrder(String orderId, BusinessIdentity identity) {
+    public JsonNode cancelOrder(String orderId, BusinessIdentity identity, java.util.UUID executionId) {
+        java.util.Objects.requireNonNull(executionId, "执行 ID 不能为空");
         return restClient.post()
+                .header("Idempotency-Key", executionId.toString())
                 .uri(properties.cancelPath(), orderId)
                 .headers(headers -> applyIdentity(headers, identity))
                 .retrieve()

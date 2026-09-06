@@ -1,5 +1,7 @@
 # Codex Single Agent Service
 
+审批及幂等链路见 [执行契约](docs/EXECUTION_CONTRACT.md)。
+
 最新实现与验收边界：[可靠性与复用说明](docs/RELIABILITY.md)。当前支持单进程、单 Runtime；真实业务幂等和生产恢复仍需端到端验收。
 
 
@@ -137,7 +139,7 @@ Codex 分析
         ↓
 如果决定 cancel_order
         ↓
-Codex pre-execution Approval
+MCP 应用服务的持久化业务审批
         ↓
 人工 approve / reject
         ↓
@@ -263,8 +265,8 @@ cancel_order(order_id="88201")
 当前边界：
 
 ```text
-Codex Approval
-= Agent 这一次能不能尝试高风险 Tool
+ExecutionService / Approval
+= 固定业务动作是否获得人工批准并签发执行 ID
 
 Business Authorization
 = OMS 最终是否真的允许当前用户执行
@@ -597,7 +599,7 @@ Skill 中的决策规则
 优先检查：
 
 ```text
-Policy / Codex MCP approval_mode
+MCP 应用服务 → 内部执行授权接口 → PostgreSQL 审批
 ```
 
 不是靠 Skill 写一句“请审批”解决。

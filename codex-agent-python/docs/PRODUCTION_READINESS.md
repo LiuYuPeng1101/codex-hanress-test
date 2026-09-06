@@ -88,7 +88,7 @@ Concurrency Limit
 
 ## 5. 写 Tool 端到端幂等：🔴 尚未闭环
 
-当前 Approval grant 可以原子消费一次，但这不等于真实 OMS 写操作只能执行一次。
+当前已实现结构化审批、固定 execution_id、并发签发与重放、期限检查，以及 MCP 到 OMS 的 Idempotency-Key。真实 OMS 原子去重尚未在此仓库实现或验收，详见 [执行契约](EXECUTION_CONTRACT.md)。
 
 必须做到：
 
@@ -109,6 +109,7 @@ Concurrency Limit
 ```text
 PostgreSQL 持久化
 PENDING / APPROVED / REJECTED / CONSUMED
+固定 execution_id、操作参数绑定、expires_at 检查
 不长时间阻塞 HTTP 请求
 租户隔离
 ```
@@ -116,9 +117,7 @@ PENDING / APPROVED / REJECTED / CONSUMED
 仍需补齐：
 
 ```text
-Approval expiry
-审批动作与最终 execution_id 绑定
-审批 UI / 操作审计
+审批 UI / 操作审计验收
 高风险动作的业务幂等
 ```
 

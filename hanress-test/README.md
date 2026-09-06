@@ -56,13 +56,14 @@ cancel_order(orderId, userId, tenantId, role)  # 错误
 X-User-Id
 X-Tenant-Id
 X-Roles
+X-Conversation-Id  # 写操作必需
 ```
 
 并构造 `BusinessIdentity`。
 
 ## 为什么身份还要继续传给 OMS？
 
-Codex Approval 只代表“允许 Agent 尝试这次 Tool Call”。最终业务操作仍必须由真实订单系统判断：
+Adapter 在取消操作前向 ExecutionService 取得人工批准的固定执行 ID。最终业务操作仍必须由真实订单系统判断：
 
 ```text
 当前用户是否有权限？
@@ -109,6 +110,8 @@ HttpOrderGateway
 MCP_SERVICE_TOKEN
 ORDER_SERVICE_BASE_URL
 ORDER_SERVICE_TOKEN
+EXECUTION_SERVICE_BASE_URL
+EXECUTION_SERVICE_SECRET
 ```
 
 可覆盖：
@@ -116,6 +119,7 @@ ORDER_SERVICE_TOKEN
 ```text
 ORDER_STATUS_PATH
 ORDER_CANCEL_PATH
+EXECUTION_SERVICE_PREPARE_PATH
 ```
 
 服务不会使用固定订单、内存状态或测试结果兜底。依赖不可用时明确失败。
@@ -127,7 +131,10 @@ export MCP_SERVICE_TOKEN='replace-with-strong-runtime-service-secret'
 export ORDER_SERVICE_BASE_URL='https://oms.internal.example'
 export ORDER_SERVICE_TOKEN='replace-with-order-service-credential'
 
-./mvnw spring-boot:run
+export EXECUTION_SERVICE_BASE_URL='http://agent-service:8000'
+export EXECUTION_SERVICE_SECRET='replace-with-distinct-internal-execution-secret'
+
+mvn spring-boot:run
 ```
 
 MCP Endpoint：
@@ -137,3 +144,5 @@ MCP Endpoint：
 ```
 
 生产部署还应在网络层叠加 mTLS / Service Mesh / NetworkPolicy，并由 Secret Manager 管理和轮换服务凭据。
+
+写操作执行授权、升级次序及 OMS 原子去重要求见 [执行契约](../codex-agent-python/docs/EXECUTION_CONTRACT.md)。当前 Adapter 只有取得有效授权后才调用 OMS，并携带 `Idempotency-Key`；重试沿用同一 ID。

@@ -21,6 +21,9 @@ class ApprovalResponse(BaseModel):
     decided_at: datetime | None
     decision: str | None
     decided_by: str | None
+    operation: str | None = None
+    operation_arguments: dict | None = None
+    expires_at: datetime | None = None
 
 
 class ApprovalListResponse(BaseModel):
